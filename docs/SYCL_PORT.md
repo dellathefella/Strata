@@ -145,6 +145,34 @@ experts while GPU runs hits + spins) — unaffected. Multi-device concurrency
 milestone 8. Doorbell latency budget: A+B ≈ 1.4 ms round trip per layer
 signal — negligible vs ~25-100 ms CPU miss-phase.
 
+## Milestone-3 spike results — Q4/Q8 kernels (tools/q4q8_kernel_bench, B60 dev1, 2026-10-03)
+
+Device capability query (tools/mx_caps): int8 DPAS combos = **M8 x N16 x K32,
+s8/u8 x s8/u8 -> s32** (fp16/bf16 = 16x16x16). ggml-sycl uses NEITHER DPAS nor
+a real dp4a (dpct::dp4a is unpack+scalar-mul emulation) — confirmed headroom.
+
+| Test | Time | Throughput | Parity |
+|---|---|---|---|
+| T1 Q8_0 GEMV float-dequant (N=K=4096) | 0.478 ms | 37.3 GB/s | 1.1e-6 |
+| T2 Q8_0 GEMV packed int8 dot | 0.175 ms | 102.1 GB/s | 1.2e-7 |
+| T3 Q4_0 GEMV float-dequant | 0.186 ms | 50.8 GB/s | 1.4e-6 |
+| T4 joint_matrix int8 DPAS microtest | — | PASS | exact |
+| T5 DPAS int8 GEMM 1024^3 (untiled v1) | 0.099 ms | **21.6 TOPS** | exact (128 samples) |
+
+Lessons:
+- int8 dot path = 2.7x the float-dequant path on GEMV; decode kernels must be int.
+- GEMV at 102 GB/s is occupancy-bound (4096 WIs, serial 128-block loop):
+  K-split + reduce should approach GDDR6 peak (~3-4x headroom).
+- DPAS GEMM untiled, global-mem loads, 16 WIs/tile: 21.6 TOPS with ~10x
+  theoretical headroom — local-memory tiling + multi-tile workgroups next.
+- GOTCHAS: first kernel launch pays SPIR-V JIT (~350 ms) — always warm up
+  before timing; joint_matrix needs `sycl::detail::dynamic_address_cast`
+  USM->multi_ptr (gmp helper); int8 accumulator 16x16 is NOT supported
+  (query `info::device::matrix_combinations` per device).
+- A same-device GPU fault required a host reboot mid-spike; all 3 B60s
+  re-enumerated clean afterward (xe minor 0/1/2). Treat long bench loops as
+  reboot-safe workloads.
+
 ## Kernel port order — Q4/Q8 focus (design directive 2026-10-03)
 
 Xe2/BMG DPAS natively accelerates INT8/INT4 dot products, so Q4_0/Q8_0/IQ4_NL
