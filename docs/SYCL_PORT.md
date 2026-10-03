@@ -127,3 +127,23 @@ inside fast islands, pipeline between islands.
 7. Pipeline stages (Strata layer-split) on SYCL.
 8. **TP groups (2-dev row-split + host-bounce all-reduce), placement
    optimizer, 3-card lagrange config = the 1+N target.**
+
+## VRAM-resident prompt cache tier (design directive 2026-10-03)
+
+Memory hierarchy for KV / prompt-cache regions, top to bottom:
+1. **VRAM pool, per pipeline stage**: each stage keeps the KV rows for its
+   layer range of every admitted session, in its own spare VRAM (hybrid
+   configs leave ~15 GB/card idle; a 128k Flash-Next session is ~3.8 GB of
+   KV at ~29.5 KiB/position). Resume = zero transfer, local to the stage —
+   works even on slow-link cards. TP pairs row-split the pool.
+2. **Host RAM**: LRU-evicted regions (halogen's current pool location).
+3. **NVMe**: on-disk cache for cold sessions.
+
+Eviction: per-region LRU within a stage; a region demotes VRAM->RAM->NVMe
+whole (rows are contiguous per region, so demotion is one sequential copy).
+Admission mirrors expert-cache accounting: reserve prompt+budget at admit.
+
+Stock-llama.cpp approximation (deployed on lagrange 2026-10-03):
+`--parallel 4 -c 131072` keeps four sessions' KV in the unified VRAM pool;
+slot prefix-resume gives halogen-style instant follow-ups without any port
+work. Measured below.
