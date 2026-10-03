@@ -120,13 +120,37 @@ inside fast islands, pipeline between islands.
 
 1. Spike: cmake seam + doorbell spin microbench on L0 (this session).
 2. Device/pinned/graph shim on L0.
-3. Decode kernel family + parity.
+3. Decode kernel family + parity — **Q4/Q8 first** (see kernel priority below).
 4. Doorbell overlap single-card.
 5. Prefill path (oneMKL + ggml-sycl MMQ).
 6. Verify window (MTP).
 7. Pipeline stages (Strata layer-split) on SYCL.
 8. **TP groups (2-dev row-split + host-bounce all-reduce), placement
    optimizer, 3-card lagrange config = the 1+N target.**
+
+## Kernel port order — Q4/Q8 focus (design directive 2026-10-03)
+
+Xe2/BMG DPAS natively accelerates INT8/INT4 dot products, so Q4_0/Q8_0/IQ4_NL
+matmuls can ride the matrix hardware; IQ2/IQ3/K-quant superblocks are
+dequant+FP-only. Port priority:
+
+1. Q4_0/Q8_0 dequant + gemv families (`s_gemv`, `iq4nl_s_gemv`, `bf16_gemv`)
+2. **DPAS INT8/INT4 matmul kernels** for Q4_0xQ8_0 / Q8_0xQ8_0 (the hardware win;
+   `sycl::ext::oneapi::experimental::joint_matrix` or ESIMD dpas)
+3. KV core (`s_kv_attn`, `s_kv_update`)
+4. IQ2/IQ3/K-quant superblock kernels LAST
+
+Model focus on Arc: Flash-Next IQ4_NL (38.9 GB, fits the dev1+dev2 TP pair
+resident) and Q8_0 (70.8 GB, hybrid/tiered). IQ3_S stays only as the current
+stock-endpoint baseline.
+
+## Deployed stock baseline (lagrange, 2026-10-03)
+
+Endpoint `qwen38-flashnext-sycl` (port 8183, dev1 `level_zero:1`): Flash-Next
+IQ3_S hybrid `-ngl 99 --cpu-moe -c 32768 -ub 8192` + mtp-Q4_0 draft —
+prefill 293.1 t/s @16k, decode 12.4 t/s, 45 s warm start. NOTE:
+`--load-mode none` wedges at -c >= 32768 (xe ioctl, clean dmesg, survives
+reboot) — mmap mode is the healthy path; upstream-bug candidate.
 
 ## Prompt cache in the big system-RAM tier (design directive 2026-10-03)
 
@@ -141,10 +165,5 @@ Memory hierarchy for KV / prompt-cache regions, top to bottom:
 3. **NVMe**: cold overflow only; rarely touched at this RAM size.
 
 Eviction: per-region LRU within a stage; a region demotes VRAM->RAM->NVMe
-whole (rows are contiguous per region, so demotion is one sequential copy).
+whole (rows are contiguous per region, so demotion = one sequential copy).
 Admission mirrors expert-cache accounting: reserve prompt+budget at admit.
-
-Stock-llama.cpp approximation (deployed on lagrange 2026-10-03):
-`--parallel 4 -c 131072` keeps four sessions' KV in the unified VRAM pool;
-slot prefix-resume gives halogen-style instant follow-ups without any port
-work. Measured below.
