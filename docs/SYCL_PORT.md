@@ -82,3 +82,48 @@ Risks (from assessment):
 
 - Streaming full expert set per prefill chunk over TB3 (physics, see table).
 - Windows/WDDM doorbell behavior (Linux-only target).
+
+## 1+N GPU topology-aware parallelism (design directive 2026-10-03)
+
+Strata ships pipeline layer-split + expert-only helper tiers. The Arc port
+adds **intra-stage tensor parallelism** so the engine scales on 1+N cards:
+
+- **1 GPU**: tiering + doorbell overlap (above). No comms.
+- **N GPUs**: partition devices into pipeline stages; any stage holding >=2
+  devices runs them **tensor-parallel (row-split)**: each GEMM shard computes
+  a column/row slice, one all-reduce of the output per op.
+- **Placement optimizer** at startup: measure per-link H2D/D2H (the h2d bench
+  in this doc) + device VRAM; form TP groups from the fastest links (all-reduce
+  volume = 2 x tokens x hidden x 2B per layer op — needs GB/s-class links),
+  assign leftover/slow devices as pipeline stages (activation crossing =
+  tokens x hidden x 2B once per stage boundary per ubatch — tolerable even
+  on x4 Gen3) or as expert-only tiers (remote_experts).
+- **The 3-card rule** (user directive, lagrange: dev1+dev2 x8 Gen3 6.8 GB/s,
+  dev0 x4 Gen3 2.5 GB/s): TP pair = {dev1, dev2}, pipeline stage = {dev0}.
+  Generalizes: odd card counts peel the slowest link into a pipeline stage
+  or expert tier; the remainder forms TP pairs.
+
+Budget check (lagrange, ub8192 prefill): TP all-reduce = 42 MB x 2 x 48 layers
+= ~4 GB/ubatch over 6.8 GB/s = 0.6 s vs ~4 s compute = 15% overhead — pays for
+2x compute. Pipeline boundary on x4: 84 MB/ubatch over 2.5 GB/s = 34 ms —
+free. Decode: TP splits weight streaming (54.8 GB / 2 cards in parallel);
+pipeline stage adds its share serially — placement puts the smallest layer
+range on the slowest card.
+
+Contrast with llama.cpp `-sm row/layer` (measured 2026-10-03, RESULTS.md):
+layer = pipeline but activations cross at EVERY layer boundary across the
+slow link (comms-bound prefill, 150-216 t/s); row = TP across ALL cards
+including the x4 (crashes + comms-bound). The 1+N scheme is neither: TP
+inside fast islands, pipeline between islands.
+
+## Milestones (updated)
+
+1. Spike: cmake seam + doorbell spin microbench on L0 (this session).
+2. Device/pinned/graph shim on L0.
+3. Decode kernel family + parity.
+4. Doorbell overlap single-card.
+5. Prefill path (oneMKL + ggml-sycl MMQ).
+6. Verify window (MTP).
+7. Pipeline stages (Strata layer-split) on SYCL.
+8. **TP groups (2-dev row-split + host-bounce all-reduce), placement
+   optimizer, 3-card lagrange config = the 1+N target.**
