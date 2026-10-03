@@ -118,7 +118,8 @@ inside fast islands, pipeline between islands.
 
 ## Milestones (updated)
 
-1. Spike: cmake seam + doorbell spin microbench on L0 (this session).
+1. Spike: cmake seam + doorbell spin microbench on L0 — **DONE 2026-10-03**
+   (results below).
 2. Device/pinned/graph shim on L0.
 3. Decode kernel family + parity — **Q4/Q8 first** (see kernel priority below).
 4. Doorbell overlap single-card.
@@ -127,6 +128,22 @@ inside fast islands, pipeline between islands.
 7. Pipeline stages (Strata layer-split) on SYCL.
 8. **TP groups (2-dev row-split + host-bounce all-reduce), placement
    optimizer, 3-card lagrange config = the 1+N target.**
+
+## Milestone-1 results (tools/l0_spin_bench, B60 dev1 x8, 2026-10-03)
+
+| Test | Result | Verdict |
+|---|---|---|
+| A host→device doorbell release→exit | 379.5 µs | PASS — system-scope atomic_ref on host-USM works |
+| B device→host store visibility | 1.04 ms | PASS — fine for mid-graph signaling |
+| C ~3 s resident spin kernel | survived, no GT reset | PASS — miss-phase waits viable |
+| D same-device GPU‖GPU (spin q2 + compute q) | **DEADLOCK** (150 s timeout) | xe/L0 does not timeslice these contexts |
+
+**Design constraint from D**: never rely on concurrent kernels on one device;
+phase order is in-stream. Strata's overlap is CPU‖GPU (CPU pool computes miss
+experts while GPU runs hits + spins) — unaffected. Multi-device concurrency
+(3-card lagrange: spin on dev0, compute on dev1/2) presumed OK, to verify in
+milestone 8. Doorbell latency budget: A+B ≈ 1.4 ms round trip per layer
+signal — negligible vs ~25-100 ms CPU miss-phase.
 
 ## Kernel port order — Q4/Q8 focus (design directive 2026-10-03)
 

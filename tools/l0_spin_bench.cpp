@@ -91,14 +91,17 @@ int main() {
         std::printf("C 3s-class spin kernel survived (sink=%d)\n", hf[3]);
     }
 
-    // D: spin kernel on q2 vs compute on q
+    // D: CPU||GPU overlap — a resident spin kernel must not starve host work
+    // (this is the real doorbell requirement: CPU pool computes miss experts
+    // while the GPU spins/runs the hit phase).
+    // NOTE: same-DEVICE GPU||GPU concurrency FAILED (deadlock, 2026-10-03):
+    // a spinning kernel on one queue blocked parallel_for on another queue —
+    // xe/L0 does not timeslice these contexts. Design constraint: never rely
+    // on concurrent kernels on one device; order phases in-stream.
     {
         sycl::queue q2(dev,
                        sycl::property_list{sycl::property::queue::in_order{}});
         int *f = hf;
-        const size_t N = 1 << 20;
-        int *a = (int *)sycl::malloc_device(N * 4, q);
-        int *b = (int *)sycl::malloc_device(N * 4, q);
         auto spin = q2.submit([&](sycl::handler &h) {
             h.single_task([=] {
                 ref_t gate(f[4]);
@@ -108,23 +111,17 @@ int main() {
                 done.store(7);
             });
         });
-        auto work = [&] {
-            auto t0 = clk::now();
-            for (int it = 0; it < 20; it++) {
-                q.parallel_for(sycl::range<1>(N),
-                               [=](sycl::id<1> i) { b[i[0]] = a[i[0]] + 1; })
-                    .wait();
-            }
-            return us(t0, clk::now()) / 20;
-        };
-        double with_spin = work();
+        // host compute while the spin kernel is resident
+        auto t0 = clk::now();
+        volatile double acc = 0;
+        for (long i = 0; i < 200000000L; i++) acc += (double)(i % 7) * 0.5;
+        double host_ms = us(t0, clk::now()) / 1000.0;
         hf[4] = 1;
         spin.wait();
-        double alone = work();
-        std::printf("D compute per-iter: alone %.1f us, with resident spin %.1f us\n",
-                    alone, with_spin);
-        sycl::free(a, q);
-        sycl::free(b, q);
+        std::printf("D host 200M-FMA loop during resident spin: %.0f ms "
+                    "(baseline without spin is the same CPU-bound loop; "
+                    "spin ack=%d)\n",
+                    host_ms, hf[5]);
     }
 
     sycl::free(hf, q);
