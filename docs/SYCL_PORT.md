@@ -185,9 +185,11 @@ dequant+FP-only. Port priority:
 3. KV core (`s_kv_attn`, `s_kv_update`)
 4. IQ2/IQ3/K-quant superblock kernels LAST
 
-Model focus on Arc: Flash-Next IQ4_NL (38.9 GB, fits the dev1+dev2 TP pair
-resident) and Q8_0 (70.8 GB, hybrid/tiered). IQ3_S stays only as the current
-stock-endpoint baseline.
+Model focus on Arc: Flash-Next Q8_0 (175 GB official GGUF; hybrid dev1
+measured PP 204 t/s @16k, TG 12.99 — decode NOT link-bound under cpu-moe,
+int8 dots beat IQ3 dequant on the AVX2 Xeon). Q4/IQ4_NL unobtainable: the
+GSQ-RCO repo vanished from HF. IQ3_S = prior baseline (PP 289.5, TG 12.66).
+GPU-resident Q8 experts via Strata tiering + DPAS kernels is the uplift path.
 
 ## Deployed stock baseline (lagrange, 2026-10-03)
 
