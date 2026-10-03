@@ -128,16 +128,17 @@ inside fast islands, pipeline between islands.
 8. **TP groups (2-dev row-split + host-bounce all-reduce), placement
    optimizer, 3-card lagrange config = the 1+N target.**
 
-## VRAM-resident prompt cache tier (design directive 2026-10-03)
+## Prompt cache in the big system-RAM tier (design directive 2026-10-03)
 
 Memory hierarchy for KV / prompt-cache regions, top to bottom:
-1. **VRAM pool, per pipeline stage**: each stage keeps the KV rows for its
-   layer range of every admitted session, in its own spare VRAM (hybrid
-   configs leave ~15 GB/card idle; a 128k Flash-Next session is ~3.8 GB of
-   KV at ~29.5 KiB/position). Resume = zero transfer, local to the stage —
-   works even on slow-link cards. TP pairs row-split the pool.
-2. **Host RAM**: LRU-evicted regions (halogen's current pool location).
-3. **NVMe**: on-disk cache for cold sessions.
+1. **VRAM**: the active slot's KV only (per pipeline stage; TP pairs
+   row-split it). A 128k Flash-Next session is ~3.8 GB at ~29.5 KiB/position.
+2. **System RAM — the prompt cache** (corrected directive: the clever tier
+   is the huge host RAM, 251 GB on lagrange vs halogen's 128 GB unified):
+   every admitted session's regions live here whole; resume = one
+   sequential RAM->VRAM copy per stage (6.8 GB/s on x8 links: a 128k
+   session restores in ~0.6 s). Capacity: ~60 full 128k sessions.
+3. **NVMe**: cold overflow only; rarely touched at this RAM size.
 
 Eviction: per-region LRU within a stage; a region demotes VRAM->RAM->NVMe
 whole (rows are contiguous per region, so demotion is one sequential copy).
