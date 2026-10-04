@@ -41,7 +41,10 @@ add_library(strata_kernels_sycl STATIC
   src/kernels/sycl/rope.cpp
   src/kernels/sycl/native_rope.cpp
   src/kernels/sycl/elementwise.cpp
-  src/kernels/sycl/dequant_bf16.cpp)
+  src/kernels/sycl/dequant_bf16.cpp
+  src/kernels/sycl/s2_gemv.cpp
+  src/kernels/sycl/s2_gemv_quads.cpp
+  src/kernels/sycl/s2_gemv_fast.cpp)
 target_link_libraries(strata_kernels_sycl PUBLIC strata_sycl_runtime strata_warnings)
 
 # ---- parity gates: the CUDA parity tests, compiled unmodified against the shim ----
@@ -56,6 +59,12 @@ target_link_libraries(rope_parity_sycl PRIVATE strata_kernels_sycl strata_sycl_r
 
 add_executable(elementwise_parity_sycl src/kernels/elementwise_parity.cpp)
 target_link_libraries(elementwise_parity_sycl PRIVATE strata_kernels_sycl strata_sycl_runtime)
+
+add_executable(s2_gemv_parity_sycl src/kernels/s2_gemv_parity.cpp)
+target_link_libraries(s2_gemv_parity_sycl PRIVATE strata_kernels_sycl strata_sycl_runtime)
+
+add_executable(s_gemv_parity_sycl src/kernels/s_gemv_parity.cpp)
+target_link_libraries(s_gemv_parity_sycl PRIVATE strata_kernels_sycl strata_sycl_runtime)
 # Two icpx host-codegen quirks, both measured (dbg repros in the port log):
 #   1. -O1..-O3 inline+fold `want[i] = x[i]*s` into a 1-ulp-off double-rounded
 #      constant (466/1024 false diffs vs the IEEE-exact device kernel);
@@ -70,6 +79,8 @@ add_test(NAME s2_gemv_q8_parity_sycl COMMAND s2_gemv_q8_parity_sycl --selftest)
 add_test(NAME router_top10_parity_sycl COMMAND router_top10_parity_sycl --selftest)
 add_test(NAME rope_parity_sycl COMMAND rope_parity_sycl --selftest)
 add_test(NAME elementwise_parity_sycl COMMAND elementwise_parity_sycl --selftest)
+add_test(NAME s2_gemv_parity_sycl COMMAND s2_gemv_parity_sycl --selftest)
+add_test(NAME s_gemv_parity_sycl COMMAND s_gemv_parity_sycl --selftest)
 
 # ---- milestone benches ----
 add_executable(l0_spin_bench tools/l0_spin_bench.cpp)

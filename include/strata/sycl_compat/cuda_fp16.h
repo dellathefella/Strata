@@ -24,3 +24,8 @@ inline sycl::float2 __half22float2(__half2 h) { return h.convert<float>(); }
 inline __half2 __float22half2_rn(sycl::float2 f) {
     return sycl::half2(sycl::half(f.x()), sycl::half(f.y()));
 }
+inline float __low2float(__half2 h) { return static_cast<float>(h.x()); }
+inline float __high2float(__half2 h) { return static_cast<float>(h.y()); }
+inline __half2 __floats2half2_rn(float a, float b) {
+    return sycl::half2(sycl::half(a), sycl::half(b));
+}
