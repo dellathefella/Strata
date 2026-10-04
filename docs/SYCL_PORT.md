@@ -120,14 +120,31 @@ inside fast islands, pipeline between islands.
 
 1. Spike: cmake seam + doorbell spin microbench on L0 — **DONE 2026-10-03**
    (results below).
-2. Device/pinned/graph shim on L0.
-3. Decode kernel family + parity — **Q4/Q8 first** (see kernel priority below).
+2. Device/pinned/graph shim on L0 — **PARTIAL 2026-10-04**: sycl_compat
+   cuda_runtime shim (USM malloc/memcpy/streams/events/host-alloc) compiles
+   Strata's CUDA parity tests UNMODIFIED; cudaGraph* calls are NOT shimmed yet.
+3. Decode kernel family + parity — **FIRST FAMILY GREEN 2026-10-04**:
+   `quantize_act` (Q8_0/Q8_K quant/dequant, incl. the double-division rint
+   rule), `s2_gemv_q8`, `s_gemv`/`s_gemv_split`(_async) ported to SYCL
+   (src/kernels/sycl/); `s2_gemv_q8_parity --selftest` passes on B60:
+   worst rel 4.5e-05 (gate 1e-4), activation-contract gap 0.80%.
+   dpct is NOT available in oneAPI 2026.1 (no dpcpp-ct package; SYCLomatic
+   would need a source build) — ports are hand-written, which also lets
+   them target DPAS directly.
 4. Doorbell overlap single-card.
 5. Prefill path (oneMKL + ggml-sycl MMQ).
 6. Verify window (MTP).
 7. Pipeline stages (Strata layer-split) on SYCL.
 8. **TP groups (2-dev row-split + host-bounce all-reduce), placement
    optimizer, 3-card lagrange config = the 1+N target.**
+
+Build recipe (lagrange, arc-engine container):
+```
+cmake -S . -B build -DCMAKE_CXX_COMPILER=icpx -DSTRATA_ENABLE_SYCL=ON \
+      -DSTRATA_BUILD_TESTS=OFF -DCMAKE_BUILD_TYPE=Release
+cmake --build build --target s2_gemv_q8_parity_sycl
+ONEAPI_DEVICE_SELECTOR=level_zero:1 ./build/s2_gemv_q8_parity_sycl --selftest
+```
 
 ## Milestone-1 results (tools/l0_spin_bench, B60 dev1 x8, 2026-10-03)
 

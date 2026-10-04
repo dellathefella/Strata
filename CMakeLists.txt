@@ -34,6 +34,7 @@ endif()
 
 option(STRATA_ENABLE_CUDA "Build the CUDA targets (Phase 2+)" OFF)
 option(STRATA_ENABLE_HIP "Build the HIP targets for wave32 AMD GPUs (gfx1100, gfx1201; gfx1030 unvalidated)" OFF)
+option(STRATA_ENABLE_SYCL "Build the SYCL targets for Intel Arc (Level Zero; configure with -DCMAKE_CXX_COMPILER=icpx)" OFF)
 option(STRATA_PREFILL_MMQ "Build the optional GGML MMQ prefill path for HIP" OFF)
 # CUDA: MMQ prompt kernels for Q4_K / Q5_K / Q5_1 (Unsloth's UD-Q4_K_XL experts).  Off by default: the engine loads
 # every kernel when it starts (CUDA_MODULE_LOADING=EAGER), so these took ~5 MB of VRAM - 1-3 expert slots - from every
@@ -46,8 +47,14 @@ endif()
 if(STRATA_ENABLE_CUDA AND STRATA_ENABLE_HIP)
   message(FATAL_ERROR "STRATA_ENABLE_CUDA and STRATA_ENABLE_HIP are separate backends; enable only one")
 endif()
+if(STRATA_ENABLE_SYCL AND (STRATA_ENABLE_CUDA OR STRATA_ENABLE_HIP))
+  message(FATAL_ERROR "STRATA_ENABLE_SYCL is a separate backend; enable only one of CUDA/HIP/SYCL")
+endif()
 if(STRATA_ENABLE_HIP)
   include(cmake/hip_backend.cmake)
+endif()
+if(STRATA_ENABLE_SYCL)
+  include(cmake/sycl_backend.cmake)
 endif()
 # The test suite and the micro benchmarks live in tests/ and bench/micro/, which the published source leaves out.
 set(_strata_tests_default OFF)
