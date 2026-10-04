@@ -28,8 +28,11 @@ target_include_directories(strata_sycl_runtime BEFORE INTERFACE
   "${STRATA_SYCL_COMPAT_INCLUDE_DIR}"
   "${CMAKE_CURRENT_SOURCE_DIR}/include")
 target_compile_options(strata_sycl_runtime INTERFACE
-  -fsycl -ffp-contract=off)   # no FMA contraction: __fmul_rn fidelity (quantize_act)
-target_link_options(strata_sycl_runtime INTERFACE -fsycl)
+  -fsycl -ffp-contract=off    # no FMA contraction: __fmul_rn fidelity (quantize_act)
+  -foffload-fp32-prec-div)    # icpx DEFAULTS device fp32 `/` to a ~28%-1ulp-off
+                              # reciprocal sequence (measured, 1M-sample sweep);
+                              # Strata's byte-exact contracts need IEEE division
+target_link_options(strata_sycl_runtime INTERFACE -fsycl -foffload-fp32-prec-div)
 target_compile_definitions(strata_sycl_runtime INTERFACE STRATA_USE_SYCL=1)
 
 # ---- ported kernel families (milestone 3: Q4/Q8 activation path first) ----
@@ -73,6 +76,9 @@ target_link_libraries(dequant_s2_parity_sycl PRIVATE strata_kernels_sycl strata_
 
 add_executable(bf16_gemv_parity_sycl src/kernels/bf16_gemv_parity.cpp)
 target_link_libraries(bf16_gemv_parity_sycl PRIVATE strata_kernels_sycl strata_sycl_runtime)
+
+add_executable(quantize_act_parity_sycl src/kernels/quantize_act_parity.cpp)
+target_link_libraries(quantize_act_parity_sycl PRIVATE strata_kernels_sycl strata_sycl_runtime)
 # Two icpx host-codegen quirks, both measured (dbg repros in the port log):
 #   1. -O1..-O3 inline+fold `want[i] = x[i]*s` into a 1-ulp-off double-rounded
 #      constant (466/1024 false diffs vs the IEEE-exact device kernel);
@@ -91,6 +97,7 @@ add_test(NAME s2_gemv_parity_sycl COMMAND s2_gemv_parity_sycl --selftest)
 add_test(NAME s_gemv_parity_sycl COMMAND s_gemv_parity_sycl --selftest)
 add_test(NAME dequant_s2_parity_sycl COMMAND dequant_s2_parity_sycl --selftest)
 add_test(NAME bf16_gemv_parity_sycl COMMAND bf16_gemv_parity_sycl --selftest)
+add_test(NAME quantize_act_parity_sycl COMMAND quantize_act_parity_sycl --selftest)
 
 # ---- milestone benches ----
 add_executable(l0_spin_bench tools/l0_spin_bench.cpp)

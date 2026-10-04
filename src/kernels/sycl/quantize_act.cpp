@@ -97,7 +97,8 @@ void quantize_q8_0_scaled(const float* x, uint8_t* blocks, float* scales, int64_
 
             float amax = 0.0f;
             for (int i = 0; i < QK8_0; ++i) amax = sycl::fmax(amax, sycl::fabs(xb[i]));
-            // VERBATIM from cpu/expert.cpp:144-145
+            // VERBATIM from cpu/expert.cpp:144-145 (IEEE division guaranteed by
+            // -foffload-fp32-prec-div)
             const float s = amax > 0.f ? amax / 127.f : 0.f;
             const float inv = s > 0.f ? 1.f / s : 0.f;
             scales[b] = s;
@@ -172,6 +173,10 @@ void quantize_q8_K(const float* x, uint8_t* blocks, int64_t n, void* stream) {
                 for (int j = 0; j < QK_K / 16; ++j) bsums[j] = 0;
                 return;
             }
+            // fp32 division, verbatim from the CUDA source — IEEE-exact because
+            // the backend compiles with -foffload-fp32-prec-div (icpx's default
+            // device division is a ~28%-1ulp-off reciprocal; see div_sweep note
+            // in cmake/sycl_backend.cmake)
             const float iscale = -127.0f / max;
             for (int j = 0; j < QK_K; ++j) {
                 // __fmul_rn == plain product under -ffp-contract=off

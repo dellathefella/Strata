@@ -146,6 +146,25 @@ cmake --build build --target s2_gemv_q8_parity_sycl
 ONEAPI_DEVICE_SELECTOR=level_zero:1 ./build/s2_gemv_q8_parity_sycl --selftest
 ```
 
+## Compiler-contract findings (icpx 2026.1, B60) — READ BEFORE PORTING KERNELS
+
+1. **Device fp32 `/` is NOT IEEE by default**: a 1M-sample sweep measured ~28%
+   of quotients 1-ulp off (reciprocal-sequence lowering). ALL Strata targets
+   must compile with **`-foffload-fp32-prec-div`** (in strata_sycl_runtime);
+   with it the sweep is 0/1048576 and quantize_act_parity is byte-exact.
+   fp64 `/` also measured inexact at default flags; double-division sites
+   (router softmax, Q8_0 rint rule) pass their tolerance/byte gates as built —
+   re-audit if a future gate tightens.
+2. `-ffp-contract=off` everywhere (the `__fmul_rn` fidelity rule).
+3. icpx HOST passes at -O2/-O3 can emit 1-ulp-off references: constant-folded
+   products at excess precision (elementwise scale fixture) and `std::fma`
+   degraded to mul+add below -O2/-march=native. Parity exes that compute
+   bit-exact host references build with `-O2 -fno-inline -march=native`.
+4. Warp shuffles port to per-32-lane-chunk LOCAL-memory trees (identical
+   pairing/order) — no sub_group-size assumptions (B60 exposes 16/32).
+5. First kernel launch pays SPIR-V JIT (~350 ms/kernel set); ctest totals ~9 s
+   warm via the persisted neo cache.
+
 ## Milestone-1 results (tools/l0_spin_bench, B60 dev1 x8, 2026-10-03)
 
 | Test | Result | Verdict |
