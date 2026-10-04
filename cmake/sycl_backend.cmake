@@ -49,7 +49,8 @@ add_library(strata_kernels_sycl STATIC
   src/kernels/sycl/s2_gemv_quads.cpp
   src/kernels/sycl/s2_gemv_fast.cpp
   src/kernels/sycl/dequant_s2.cpp
-  src/kernels/sycl/bf16_gemv.cpp)
+  src/kernels/sycl/bf16_gemv.cpp
+  src/kernels/sycl/gdn.cpp)
 target_link_libraries(strata_kernels_sycl PUBLIC strata_sycl_runtime strata_warnings)
 
 # ---- parity gates: the CUDA parity tests, compiled unmodified against the shim ----
@@ -77,6 +78,9 @@ target_link_libraries(dequant_s2_parity_sycl PRIVATE strata_kernels_sycl strata_
 add_executable(bf16_gemv_parity_sycl src/kernels/bf16_gemv_parity.cpp)
 target_link_libraries(bf16_gemv_parity_sycl PRIVATE strata_kernels_sycl strata_sycl_runtime)
 
+add_executable(gdn_parity_sycl src/kernels/gdn_parity.cpp)
+target_link_libraries(gdn_parity_sycl PRIVATE strata_kernels_sycl strata_sycl_runtime)
+
 add_executable(quantize_act_parity_sycl src/kernels/quantize_act_parity.cpp)
 target_link_libraries(quantize_act_parity_sycl PRIVATE strata_kernels_sycl strata_sycl_runtime)
 # Two icpx host-codegen quirks, both measured (dbg repros in the port log):
@@ -98,6 +102,7 @@ add_test(NAME s_gemv_parity_sycl COMMAND s_gemv_parity_sycl --selftest)
 add_test(NAME dequant_s2_parity_sycl COMMAND dequant_s2_parity_sycl --selftest)
 add_test(NAME bf16_gemv_parity_sycl COMMAND bf16_gemv_parity_sycl --selftest)
 add_test(NAME quantize_act_parity_sycl COMMAND quantize_act_parity_sycl --selftest)
+add_test(NAME gdn_parity_sycl COMMAND gdn_parity_sycl --selftest)
 
 # ---- milestone benches ----
 add_executable(l0_spin_bench tools/l0_spin_bench.cpp)
