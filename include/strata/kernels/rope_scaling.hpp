@@ -37,6 +37,10 @@
 
 #include <cmath>
 
+#if defined(STRATA_USE_SYCL)
+#include <sycl/sycl.hpp>
+#endif
+
 #if defined(__CUDACC__) || defined(__HIPCC__)
 #define STRATA_ROPE_SCALING_HD __host__ __device__
 #else
@@ -155,10 +159,20 @@ STRATA_ROPE_SCALING_HD inline void rope_scaled_angle(float theta_extrap, float f
         const float ramp_mix = rope_yarn_ramp(corr_low, corr_high, pair) * ext_factor;
         theta = theta * (1.0f - ramp_mix) + theta_extrap * ramp_mix;
         // "Get n-d magnitude scaling corrected for interpolation" - the log term only when correcting.
+#if defined(STRATA_USE_SYCL)
+        mscale *= 1.0f + 0.1f * sycl::log(1.0f / freq_scale);
+#else
         mscale *= 1.0f + 0.1f * logf(1.0f / freq_scale);
+#endif
     }
+#if defined(STRATA_USE_SYCL)
+    // the C spellings are not device-callable on the SYCL pass; sycl:: builtins are
+    cos_out = sycl::cos(theta) * mscale;
+    sin_out = sycl::sin(theta) * mscale;
+#else
     cos_out = cosf(theta) * mscale;
     sin_out = sinf(theta) * mscale;
+#endif
 }
 
 /// The ONE validity rule for a resolved configuration, shared by the engine's startup check and every rotation

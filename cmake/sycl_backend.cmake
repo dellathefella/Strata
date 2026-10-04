@@ -36,14 +36,26 @@ target_compile_definitions(strata_sycl_runtime INTERFACE STRATA_USE_SYCL=1)
 add_library(strata_kernels_sycl STATIC
   src/kernels/sycl/quantize_act.cpp
   src/kernels/sycl/s2_gemv_q8.cpp
-  src/kernels/sycl/s_gemv.cpp)
+  src/kernels/sycl/s_gemv.cpp
+  src/kernels/sycl/router_top10.cpp
+  src/kernels/sycl/rope.cpp
+  src/kernels/sycl/native_rope.cpp)
 target_link_libraries(strata_kernels_sycl PUBLIC strata_sycl_runtime strata_warnings)
 
-# ---- parity gate: the CUDA parity test, compiled unmodified against the shim ----
+# ---- parity gates: the CUDA parity tests, compiled unmodified against the shim ----
 add_executable(s2_gemv_q8_parity_sycl src/kernels/s2_gemv_q8_parity.cpp)
 target_link_libraries(s2_gemv_q8_parity_sycl PRIVATE strata_kernels_sycl strata_sycl_runtime)
+
+add_executable(router_top10_parity_sycl src/kernels/router_top10_parity.cpp)
+target_link_libraries(router_top10_parity_sycl PRIVATE strata_kernels_sycl strata_sycl_runtime)
+
+add_executable(rope_parity_sycl src/kernels/rope_parity.cpp)
+target_link_libraries(rope_parity_sycl PRIVATE strata_kernels_sycl strata_sycl_runtime)
+
 enable_testing()
 add_test(NAME s2_gemv_q8_parity_sycl COMMAND s2_gemv_q8_parity_sycl --selftest)
+add_test(NAME router_top10_parity_sycl COMMAND router_top10_parity_sycl --selftest)
+add_test(NAME rope_parity_sycl COMMAND rope_parity_sycl --selftest)
 
 # ---- milestone benches ----
 add_executable(l0_spin_bench tools/l0_spin_bench.cpp)

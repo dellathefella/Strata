@@ -274,3 +274,19 @@ inline cudaError_t cudaEventElapsedTime(float* ms, cudaEvent_t a, cudaEvent_t b)
     }
     return cudaSuccess;
 }
+
+inline cudaError_t cudaGetDevice(int* dev) {
+    // single-device backend for now; multi-device placement lands with the
+    // 1+N milestone (streams will carry their device).
+    if (!dev) return strata::sycl_compat::last_error() = cudaErrorInvalidValue;
+    *dev = 0;
+    return cudaSuccess;
+}
+
+inline cudaError_t cudaSetDevice(int) { return cudaSuccess; }
+
+// Math spellings: Strata's portable HD headers call the C names (cosf, ...).
+// Those are NOT device-callable on the SYCL pass, and neither global aliases
+// nor macros work (they collide with glibc's declarations, which the device
+// pass still parses). Instead, HD headers gain a guarded SYCL branch calling
+// sycl:: builtins directly — see rope_scaling.hpp (STRATA_USE_SYCL).
