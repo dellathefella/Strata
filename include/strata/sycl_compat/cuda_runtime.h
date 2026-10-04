@@ -11,10 +11,12 @@
 // Graphs (cudaGraph*) are NOT here yet — milestone 2 (GraphRegistry on L0).
 #pragma once
 
+#include <sycl/ext/oneapi/experimental/graph.hpp>
 #include <sycl/sycl.hpp>
 
 #include <cstddef>
 #include <cstdio>
+#include <memory>
 
 using cudaError_t = int;
 static constexpr cudaError_t cudaSuccess = 0;
@@ -37,12 +39,30 @@ enum cudaHostAllocFlags {
     cudaHostAllocWriteCombined = 4,
 };
 
+enum cudaStreamFlags {
+    cudaStreamDefault = 0,
+    cudaStreamNonBlocking = 1,
+};
+
 namespace strata::sycl_compat {
+
+namespace ex = sycl::ext::oneapi::experimental;
 
 struct stream_wrap {
     sycl::queue q;
+    // non-null between cudaStreamBeginCapture and cudaStreamEndCapture
+    std::unique_ptr<ex::command_graph<ex::graph_state::modifiable>> rec;
     explicit stream_wrap(const sycl::device& d)
         : q(d, sycl::property_list{sycl::property::queue::in_order{}}) {}
+};
+
+struct graph_wrap {
+    std::unique_ptr<ex::command_graph<ex::graph_state::modifiable>> g;
+};
+
+// owns the finalized (executable) graph; cudaGraphExecDestroy frees it
+struct graphexec_wrap {
+    std::unique_ptr<ex::command_graph<ex::graph_state::executable>> g;
 };
 
 struct event_wrap {
@@ -284,6 +304,81 @@ inline cudaError_t cudaGetDevice(int* dev) {
 }
 
 inline cudaError_t cudaSetDevice(int) { return cudaSuccess; }
+
+// ---------------- CUDA graphs on SYCL experimental command graphs -----------
+using cudaGraph_t = strata::sycl_compat::graph_wrap*;
+using cudaGraphExec_t = strata::sycl_compat::graphexec_wrap*;
+
+enum cudaStreamCaptureMode {
+    cudaStreamCaptureModeGlobal = 0,
+    cudaStreamCaptureModeThreadLocal = 1,
+    cudaStreamCaptureModeRelaxed = 2,
+};
+
+inline cudaError_t cudaStreamBeginCapture(cudaStream_t s, cudaStreamCaptureMode) {
+    if (!s) return strata::sycl_compat::last_error() = cudaErrorInvalidValue;
+    namespace ex = sycl::ext::oneapi::experimental;
+    try {
+        s->rec = std::make_unique<ex::command_graph<ex::graph_state::modifiable>>(s->q);
+        s->rec->begin_recording(s->q);
+    } catch (const sycl::exception& exn) {
+        std::fprintf(stderr, "sycl_compat cudaStreamBeginCapture: %s\n", exn.what());
+        return strata::sycl_compat::last_error() = cudaErrorUnknown;
+    }
+    return cudaSuccess;
+}
+
+inline cudaError_t cudaStreamEndCapture(cudaStream_t s, cudaGraph_t* graph) {
+    if (!s || !graph || !s->rec)
+        return strata::sycl_compat::last_error() = cudaErrorInvalidValue;
+    try {
+        s->rec->end_recording();
+        *graph = new strata::sycl_compat::graph_wrap{std::move(s->rec)};
+    } catch (const sycl::exception& exn) {
+        std::fprintf(stderr, "sycl_compat cudaStreamEndCapture: %s\n", exn.what());
+        return strata::sycl_compat::last_error() = cudaErrorUnknown;
+    }
+    return cudaSuccess;
+}
+
+inline cudaError_t cudaGraphInstantiate(cudaGraphExec_t* exec, cudaGraph_t graph,
+                                        unsigned long long) {
+    if (!exec || !graph) return strata::sycl_compat::last_error() = cudaErrorInvalidValue;
+    try {
+        *exec = new strata::sycl_compat::graphexec_wrap{
+            std::make_unique<sycl::ext::oneapi::experimental::command_graph<
+                sycl::ext::oneapi::experimental::graph_state::executable>>(
+                graph->g->finalize())};
+    } catch (const sycl::exception& exn) {
+        std::fprintf(stderr, "sycl_compat cudaGraphInstantiate: %s\n", exn.what());
+        return strata::sycl_compat::last_error() = cudaErrorUnknown;
+    }
+    return cudaSuccess;
+}
+
+inline cudaError_t cudaGraphLaunch(cudaGraphExec_t exec, cudaStream_t s) {
+    if (!exec) return strata::sycl_compat::last_error() = cudaErrorInvalidValue;
+    try {
+        // in-order queue: the returned event is dropped, ordering is implicit
+        strata::sycl_compat::q_for(s).ext_oneapi_graph(*exec->g);
+    } catch (const sycl::exception& exn) {
+        std::fprintf(stderr, "sycl_compat cudaGraphLaunch: %s\n", exn.what());
+        return strata::sycl_compat::last_error() = cudaErrorUnknown;
+    }
+    return cudaSuccess;
+}
+
+inline cudaError_t cudaGraphUpload(cudaGraphExec_t, cudaStream_t) { return cudaSuccess; }
+
+inline cudaError_t cudaGraphExecDestroy(cudaGraphExec_t exec) {
+    delete exec;
+    return cudaSuccess;
+}
+
+inline cudaError_t cudaGraphDestroy(cudaGraph_t graph) {
+    delete graph;
+    return cudaSuccess;
+}
 
 // Math spellings: Strata's portable HD headers call the C names (cosf, ...).
 // Those are NOT device-callable on the SYCL pass, and neither global aliases

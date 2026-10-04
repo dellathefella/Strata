@@ -20,6 +20,21 @@
 
 #include <cstdint>
 
+#if defined(__SYCL_DEVICE_ONLY__) || defined(STRATA_USE_SYCL)
+// SYCL backend: no __dp4a/__nanosleep spellings. The scalar unpack below is
+// bit-exact with __dp4a's signed-byte semantics (llama.cpp's own fallback,
+// same reasoning as the Pascal branch); the pause is a no-op — every call site
+// is a single-thread doorbell spin, so nothing else is delayed. A future DPAS
+// path supersedes STRATA_DP4A for the GEMM families (docs/SYCL_PORT.md).
+inline int strata_dp4a(const int a, const int b, const int c) {
+    const int8_t* a8 = (const int8_t*)&a;
+    const int8_t* b8 = (const int8_t*)&b;
+    return c + a8[0] * b8[0] + a8[1] * b8[1] + a8[2] * b8[2] + a8[3] * b8[3];
+}
+#define STRATA_DP4A(a, b, c) strata_dp4a((a), (b), (c))
+inline void strata_spin_pause() {}
+#else
+
 #if defined(__CUDA_ARCH__) && __CUDA_ARCH__ < 610
 __device__ __forceinline__ int strata_dp4a(const int a, const int b, const int c) {
     const int8_t* a8 = (const int8_t*) &a;
@@ -40,3 +55,5 @@ __device__ __forceinline__ void strata_spin_pause() {
     __nanosleep(100);
 #endif
 }
+
+#endif  // SYCL branch

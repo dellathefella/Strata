@@ -39,7 +39,9 @@ add_library(strata_kernels_sycl STATIC
   src/kernels/sycl/s_gemv.cpp
   src/kernels/sycl/router_top10.cpp
   src/kernels/sycl/rope.cpp
-  src/kernels/sycl/native_rope.cpp)
+  src/kernels/sycl/native_rope.cpp
+  src/kernels/sycl/elementwise.cpp
+  src/kernels/sycl/dequant_bf16.cpp)
 target_link_libraries(strata_kernels_sycl PUBLIC strata_sycl_runtime strata_warnings)
 
 # ---- parity gates: the CUDA parity tests, compiled unmodified against the shim ----
@@ -52,10 +54,22 @@ target_link_libraries(router_top10_parity_sycl PRIVATE strata_kernels_sycl strat
 add_executable(rope_parity_sycl src/kernels/rope_parity.cpp)
 target_link_libraries(rope_parity_sycl PRIVATE strata_kernels_sycl strata_sycl_runtime)
 
+add_executable(elementwise_parity_sycl src/kernels/elementwise_parity.cpp)
+target_link_libraries(elementwise_parity_sycl PRIVATE strata_kernels_sycl strata_sycl_runtime)
+# Two icpx host-codegen quirks, both measured (dbg repros in the port log):
+#   1. -O1..-O3 inline+fold `want[i] = x[i]*s` into a 1-ulp-off double-rounded
+#      constant (466/1024 false diffs vs the IEEE-exact device kernel);
+#      -fno-inline stops it.
+#   2. on baseline x86-64 std::fma lowers to mul+add (the test's fma_diff
+#      self-check then sees 0 and fails); -march=native emits vfmadd.
+# The DEVICE kernel is IEEE-exact at every level; this is host-reference hygiene.
+target_compile_options(elementwise_parity_sycl PRIVATE -O2 -fno-inline -march=native)
+
 enable_testing()
 add_test(NAME s2_gemv_q8_parity_sycl COMMAND s2_gemv_q8_parity_sycl --selftest)
 add_test(NAME router_top10_parity_sycl COMMAND router_top10_parity_sycl --selftest)
 add_test(NAME rope_parity_sycl COMMAND rope_parity_sycl --selftest)
+add_test(NAME elementwise_parity_sycl COMMAND elementwise_parity_sycl --selftest)
 
 # ---- milestone benches ----
 add_executable(l0_spin_bench tools/l0_spin_bench.cpp)
