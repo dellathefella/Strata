@@ -68,7 +68,11 @@ add_library(strata_kernels_sycl STATIC
   src/kernels/sycl/qsa.cpp
   src/kernels/sycl/qsa_decode_attn.cpp
   src/kernels/sycl/native_mmvq.cpp
-  src/kernels/sycl/stubs_not_ported.cpp)
+  src/kernels/sycl/stubs_not_ported.cpp
+  src/kernels/sycl/sampler.cpp
+  src/kernels/sycl/shared_expert.cpp
+  src/kernels/sycl/native_qsa_indexer.cpp
+  src/kernels/sycl/iq_embed.cpp)
 target_link_libraries(strata_kernels_sycl PUBLIC strata_sycl_runtime strata_warnings)
 
 # ---- parity gates: the CUDA parity tests, compiled unmodified against the shim ----

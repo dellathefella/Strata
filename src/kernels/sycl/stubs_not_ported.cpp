@@ -49,10 +49,6 @@ bool PleTable::gather_batch(const uint32_t*, size_t, float*, std::string&) { unp
 bool PleTable::is_open() const { return false; }
 
 // ---- sampler ----
-void sample_tokens(const float*, int, int, const int*, int, const SamplerParams&, int*, void*) {
-    unported("sample_tokens");
-}
-bool sample_greedy_cluster(const float*, int, int, int*, void*) { unported("sample_greedy_cluster"); }
 size_t coupled_draft_scratch_bytes(int) { unported("coupled_draft_scratch_bytes"); }
 void coupled_draft_stage(const SamplerParams*, const int32_t*, SamplerParams*, int32_t*, int, void*) {
     unported("coupled_draft_stage");
@@ -68,10 +64,6 @@ void shared_expert(const uint8_t*, const uint8_t*, const uint16_t*, const SForm&
                    const uint8_t*, const float*, const float*, const uint16_t*, float*, float*, int64_t, int64_t, int,
                    void*, const float*, const NativeSharedWeights*) {
     unported("shared_expert");
-}
-void shared_expert_multi(int, const float*, const uint16_t*, const NativeSharedWeights&, const uint16_t*, float*,
-                         float*, float*, float*, int64_t, int64_t, void*) {
-    unported("shared_expert_multi");
 }
 void moe_combine(const float*, const float*, const float*, float*, int64_t, int64_t, void*) {
     unported("moe_combine");
@@ -113,16 +105,9 @@ void native_expert_grouped(const NativeExpertLayout&, const unsigned long long*,
 }
 void iq_set_old_kernels(bool) {}
 bool iq_old_kernels() { return false; }
-void iq_mmvq(int, const void*, const void*, float*, int, int, int, void*) { unported("iq_mmvq"); }
-void iq_dequant_f32(int, const void*, int64_t, float*, void*) { unported("iq_dequant_f32"); }
-void iq_dequant_f16(int, const void*, int64_t, uint16_t*, void*) { unported("iq_dequant_f16"); }
-void iq_embed_rows(int, const void*, size_t, const int32_t*, int64_t, int64_t, float*, void*) {
-    unported("iq_embed_rows");
-}
 void iq_dequant_gu_f16(int, const void*, const void*, int64_t, int64_t, uint16_t*, void*) {
     unported("iq_dequant_gu_f16");
 }
-bool embed_type_supported(int) noexcept { return false; }
 void quantize_q8_1_rows(const float*, int64_t, int64_t, void*, void*) { unported("quantize_q8_1_rows"); }
 
 // ---- native GDN preprocess ----
@@ -139,15 +124,6 @@ void native_gdn_out_norm(const float*, const float*, const float*, float*, int64
 }
 
 // ---- native QSA indexer ----
-void native_qsa_indexer_append(const float*, const int32_t*, int32_t, const float*, float,
-                               const QsaIndexerBuffers&, const QsaShapes&, int64_t, const RopeScaling&, void*) {
-    unported("native_qsa_indexer_append");
-}
-void native_qsa_indexer_append_batch(const float*, int64_t, int64_t, int32_t, const float*, float,
-                                     const QsaIndexerBuffers&, const QsaShapes&, int64_t, const RopeScaling&,
-                                     void*) {
-    unported("native_qsa_indexer_append_batch");
-}
 
 // ---- flash attention short step ----
 void native_flash_attn_short_step(const float*, const uint16_t*, const uint16_t*, const int32_t*, int64_t, int,
@@ -198,7 +174,6 @@ void s_gemv_q8_0_split(const uint8_t*, const uint8_t*, const float*, const float
     unported("s_gemv_q8_0_split");
 }
 uint64_t shared_expert_scratch_bytes(int64_t) { return uint64_t(1) << 20; }
-void shared_expert_set_native_bf16(bool) {}
 void moe_hit_grouped_s2_cpu_order(const uint8_t*, const int32_t*, const int32_t*, int64_t, int64_t, const uint8_t*,
                                   void*, float*, void*, const float*, float*) {
     unported("moe_hit_grouped_s2_cpu_order");
@@ -238,8 +213,6 @@ bool cvec_replicate(std::string& err) {
     return false;
 }
 
-void native_qsa_indexer_set_enabled(bool) {}
-bool native_qsa_indexer_enabled() { return false; }
 
 }  // namespace strata::kernels
 
