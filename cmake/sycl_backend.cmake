@@ -66,7 +66,9 @@ add_library(strata_kernels_sycl STATIC
   src/kernels/sycl/kv_q4.cpp
   src/kernels/sycl/kv_stream.cpp
   src/kernels/sycl/qsa.cpp
-  src/kernels/sycl/qsa_decode_attn.cpp)
+  src/kernels/sycl/qsa_decode_attn.cpp
+  src/kernels/sycl/native_mmvq.cpp
+  src/kernels/sycl/stubs_not_ported.cpp)
 target_link_libraries(strata_kernels_sycl PUBLIC strata_sycl_runtime strata_warnings)
 
 # ---- parity gates: the CUDA parity tests, compiled unmodified against the shim ----
@@ -172,3 +174,15 @@ add_library(strata_engine STATIC
 target_include_directories(strata_engine PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/include)
 target_link_libraries(strata_engine PUBLIC strata_core strata_kernels strata_kernels_cpu
                                             strata_sycl_runtime)
+
+# ---- prefill + the generate binary on SYCL -------------------------------
+# prefill.cpp is host-shaped and compiles against the shim; gemm.cu/kernels.cu
+# are stand-ins (src/prefill/sycl_stub.cpp) until the oneMKL GEMM and batched
+# kernel ports land. The short-prompt and per-token paths never call them.
+add_library(strata_prefill STATIC src/prefill/prefill.cpp src/prefill/sycl_stub.cpp)
+target_include_directories(strata_prefill PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/include)
+target_link_libraries(strata_prefill PUBLIC strata_engine strata_sycl_runtime)
+
+add_executable(strata src/program/generate.cpp)
+target_include_directories(strata PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/include)
+target_link_libraries(strata PRIVATE strata_engine strata_prefill strata_spec strata_sycl_runtime)

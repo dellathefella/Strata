@@ -213,6 +213,10 @@ inline cudaError_t cudaMemcpyAsync(void* dst, const void* src, size_t n,
     return strata::sycl_compat::last_error() = cudaSuccess;
 }
 
+inline cudaError_t cudaMemcpyAsync(void* dst, const void* src, size_t n, cudaMemcpyKind k) {
+    return cudaMemcpyAsync(dst, src, n, k, nullptr);
+}
+
 inline cudaError_t cudaMemset(void* dst, int v, size_t n) {
     try {
         strata::sycl_compat::default_queue().memset(dst, v, n).wait_and_throw();
