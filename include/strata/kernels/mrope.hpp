@@ -45,7 +45,11 @@ RopeTab rope_table_for(const RopeScaling& scaling);
 #if defined(__CUDACC__) || defined(__HIPCC__)
 /// ggml rope_multi, is_imrope, sections {11, 11, 10, 0}: sector = pair % 32; sector % 3 == 1 -> h (sector < 33),
 /// == 2 -> w (sector < 30), == 0 -> t (sector < 33).  For pairs 0..31 all three bounds hold, so it is pair % 3.
+#if defined(__SYCL_DEVICE_ONLY__) || defined(STRATA_USE_SYCL)
+inline int mrope_pos(const int32_t* tab, int pos, int pair) {
+#else
 __device__ __forceinline__ int mrope_pos(const int32_t* tab, int pos, int pair) {
+#endif
     return tab ? __ldg(tab + (size_t) pos * 3 + pair % 3) : pos;
 }
 /// cos and sin of rotary position p, pair `pair` (0..31) from the table (scaling and magnitude included); false
