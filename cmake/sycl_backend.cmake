@@ -61,7 +61,10 @@ add_library(strata_kernels_sycl STATIC
   src/kernels/sycl/native_router.cpp
   src/kernels/sycl/native_moe.cpp
   src/kernels/sycl/fused_gdn.cpp
-  src/kernels/sycl/native_gdn.cpp)
+  src/kernels/sycl/native_gdn.cpp
+  src/kernels/sycl/kv_q8.cpp
+  src/kernels/sycl/kv_q4.cpp
+  src/kernels/sycl/kv_stream.cpp)
 target_link_libraries(strata_kernels_sycl PUBLIC strata_sycl_runtime strata_warnings)
 
 # ---- parity gates: the CUDA parity tests, compiled unmodified against the shim ----
