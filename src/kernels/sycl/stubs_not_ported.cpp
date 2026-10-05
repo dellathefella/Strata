@@ -29,30 +29,6 @@ namespace {
 }  // namespace
 
 // ---- PLE (n-gram table + block) ----
-uint64_t ple_block_scratch_bytes() { unported("ple_block_scratch_bytes"); }
-void ple_block(const float*, const float*, const float*, const PleWeights&, PleOut&, void*, void*) {
-    unported("ple_block");
-}
-void ple_history_advance(float*, const float*, void*) { unported("ple_history_advance"); }
-bool ple_block_available() { return false; }
-void native_ple_postops(const float*, const float*, const float*, const float*, const PleWeights&,
-                        const NativePlePostopsBuffers&, void*) {
-    unported("native_ple_postops");
-}
-void native_ple_postops_batch(float*, float*, const float*, float*, const PleWeights&, float*, float*, float*, int,
-                              void*) {
-    unported("native_ple_postops_batch");
-}
-bool PleTable::issue(const uint32_t*) { unported("PleTable::issue"); }
-bool PleTable::collect(float*, std::string&) { unported("PleTable::collect"); }
-bool PleTable::gather_batch(const uint32_t*, size_t, float*, std::string&) { unported("PleTable::gather_batch"); }
-bool PleTable::is_open() const { return false; }
-
-// ---- sampler ----
-size_t coupled_draft_scratch_bytes(int) { unported("coupled_draft_scratch_bytes"); }
-void coupled_draft_stage(const SamplerParams*, const int32_t*, SamplerParams*, int32_t*, int, void*) {
-    unported("coupled_draft_stage");
-}
 void coupled_draft_sample(float*, int, const int32_t*, const int32_t*, int, const SamplerParams*, int32_t*, int, int,
                           const int32_t*, void*, int32_t*, float*, void*) {
     unported("coupled_draft_sample");
@@ -96,39 +72,10 @@ void moe_hit_select_multi(const int32_t*, const int32_t*, int, int, int32_t*, in
 }
 
 // ---- native (GGUF-block) grouped experts + iq dequant/embed ----
-NativeExpertLayout native_expert_layout(int, int, int64_t, int64_t) { unported("native_expert_layout"); }
-bool native_expert_supported(int, int, int64_t, int64_t) noexcept { return false; }
-size_t native_expert_scratch_bytes(int64_t, int64_t) { unported("native_expert_scratch_bytes"); }
-void native_expert_grouped(const NativeExpertLayout&, const unsigned long long*, const int32_t*, const int32_t*,
-                           const int32_t*, const int32_t*, int64_t, int64_t, const void*, void*, float*, void*) {
-    unported("native_expert_grouped");
-}
 void iq_set_old_kernels(bool) {}
 bool iq_old_kernels() { return false; }
 void iq_dequant_gu_f16(int, const void*, const void*, int64_t, int64_t, uint16_t*, void*) {
     unported("iq_dequant_gu_f16");
-}
-void quantize_q8_1_rows(const float*, int64_t, int64_t, void*, void*) { unported("quantize_q8_1_rows"); }
-
-// ---- native GDN preprocess ----
-void native_gdn_conv_silu(float*, const float*, const float*, float*, float*, int64_t, int64_t, void*) {
-    unported("native_gdn_conv_silu");
-}
-void native_gdn_l2_norm(float*, int64_t, int64_t, float, void*) { unported("native_gdn_l2_norm"); }
-void native_gdn_beta_gate(float*, int64_t, void*) { unported("native_gdn_beta_gate"); }
-void native_gdn_gate(const float*, const float*, const float*, float*, int64_t, void*) {
-    unported("native_gdn_gate");
-}
-void native_gdn_out_norm(const float*, const float*, const float*, float*, int64_t, int64_t, float, void*) {
-    unported("native_gdn_out_norm");
-}
-
-// ---- native QSA indexer ----
-
-// ---- flash attention short step ----
-void native_flash_attn_short_step(const float*, const uint16_t*, const uint16_t*, const int32_t*, int64_t, int,
-                                  const QsaShapes&, float*, int32_t*, const uint16_t*, void*) {
-    unported("native_flash_attn_short_step");
 }
 
 // ---- control vectors ----
@@ -153,14 +100,6 @@ void s_gemv_q8k(const uint8_t*, const uint8_t*, const float*, const float*, floa
 
 namespace strata::kernels {
 
-void qsa_block_scores(const float*, const float*, const float*, const int32_t*, int64_t, int64_t, const QsaShapes&,
-                      float*, void*, int64_t) {
-    unported("qsa_block_scores");
-}
-void qsa_block_topk(const float*, const int32_t*, int64_t, int64_t, int64_t, const QsaShapes&, int32_t*, void*,
-                    int64_t) {
-    unported("qsa_block_topk");
-}
 void qsa_decode_attn_step(const float*, const QsaAttnPools&, const int32_t*, const int32_t*, int64_t, const QsaShapes&,
                           float*, float*, void*) {
     unported("qsa_decode_attn_step");
@@ -179,25 +118,6 @@ void moe_hit_grouped_s2_cpu_order(const uint8_t*, const int32_t*, const int32_t*
     unported("moe_hit_grouped_s2_cpu_order");
 }
 
-void ple_set_native_bf16(bool) {}
-void ple_set_native_postops(bool) {}
-bool ple_native_postops_enabled() { return false; }
-PleConsts ple_artifact_consts() { return PleConsts{}; }
-void ple_prefetch_enable(bool) {}
-bool ple_prefetch_enabled() { return false; }
-void ngram_rows(const int32_t*, const int32_t*, int, const PleConsts&, uint32_t*) { unported("ngram_rows"); }
-
-PleTable::PleTable() = default;
-PleTable::~PleTable() = default;
-bool PleTable::open(const std::string&, std::string& err, const PleIoOptions&) {
-    err = "SYCL backend: the PLE table reader is not ported yet";
-    return false;
-}
-bool PleTable::open(const std::string& p, std::string& err) { return open(p, err, PleIoOptions{}); }
-void PleTable::set_injected_delay_us(double) {}
-bool PleTable::locked() const { return false; }
-uint64_t PleTable::rows() const { return 0; }
-std::string PleTable::io_report() const { return "sycl stub"; }
 
 const Cvec& cvec() {
     static Cvec c;
@@ -217,12 +137,22 @@ bool cvec_replicate(std::string& err) {
 }  // namespace strata::kernels
 
 namespace strata::kernels {
-bool qsa_block_scores_tc(const float*, const float*, const float*, const int32_t*, int64_t, int64_t, const QsaShapes&,
-                         float*, void*, int64_t) {
-    return false;  // tensor-core variant: never selected on SYCL
-}
 void qsa_prompt_attn_batch(const float*, const QsaAttnPools&, const int32_t*, const int32_t*, int64_t,
                            const QsaShapes&, float*, int64_t, void*) {
     unported("qsa_prompt_attn_batch");
+}
+}  // namespace strata::kernels
+
+namespace strata::kernels {
+size_t coupled_draft_scratch_bytes(int) { unported("coupled_draft_scratch_bytes"); }
+void coupled_draft_stage(const SamplerParams*, const int32_t*, SamplerParams*, int32_t*, int, void*) {
+    unported("coupled_draft_stage");
+}
+}  // namespace strata::kernels
+
+namespace strata::kernels {
+void native_flash_attn_short_step(const float*, const uint16_t*, const uint16_t*, const int32_t*, int64_t, int,
+                                  const QsaShapes&, float*, int32_t*, const uint16_t*, void*) {
+    unported("native_flash_attn_short_step");
 }
 }  // namespace strata::kernels

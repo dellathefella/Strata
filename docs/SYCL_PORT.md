@@ -138,7 +138,9 @@ inside fast islands, pipeline between islands.
 8. **TP groups (2-dev row-split + host-bounce all-reduce), placement
    optimizer, 3-card lagrange config = the 1+N target.**
 
-Build recipe (lagrange, arc-engine container):
+Build recipe (lagrange, `localhost/strata:sycl-build` container; the image was
+retagged from its historical `llama.cpp:arc-engine` name — it is a oneAPI +
+ggml toolchain image, not a llama.cpp build):
 ```
 cmake -S . -B build -DCMAKE_CXX_COMPILER=icpx -DSTRATA_ENABLE_SYCL=ON \
       -DSTRATA_BUILD_TESTS=OFF -DCMAKE_BUILD_TYPE=Release

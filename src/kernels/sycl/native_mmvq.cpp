@@ -359,6 +359,12 @@ void native_quantize_q8_1(const float* x, void* x_q8_1, int n_in, int ncols, voi
     if (e != cudaSuccess) throw std::runtime_error(std::string("native Q8_1 quantize: ") + cudaGetErrorString(e));
 }
 
+void quantize_q8_1_rows(const float* x, int64_t n_rows, int64_t n_cols, void* y, void* stream) {
+    // rows are contiguous and n_cols is a multiple of 32, so the flat
+    // element-wise kernel is exactly the row-wise one
+    native_quantize_q8_1(x, y, (int) n_cols, (int) n_rows, stream);
+}
+
 void native_q4_0_mmvq(const void* w, const void* x, float* y, int n_in, int n_out, int nc, void* s) {
     small_mmvq<Q40Block, 4>(w, x, y, n_in, n_out, nc, s);
 }

@@ -4,7 +4,9 @@
 // per-token path do not call these; a prompt that needs the batched path
 // fails loudly here until the oneMKL GEMM + batched kernel port lands
 // (docs/SYCL_PORT.md milestone 5).
-#include "strata/prefill/gemm.hpp"
+#include "strata/prefill/kernels.hpp"
+
+#include <cuda_runtime.h>  // sycl_compat shim
 #include "strata/prefill/kernels.hpp"
 
 #include <stdexcept>
@@ -17,25 +19,10 @@ namespace {
 }
 }  // namespace
 
-Gemm::~Gemm() = default;
-bool Gemm::init(void*, int64_t, std::string& err) {
-    err = "SYCL backend: the batched prefill GEMM (oneMKL) is not ported yet";
-    return false;
-}
-bool Gemm::init_external(void*, uint16_t*, int64_t, void*, size_t, std::string& err) {
-    err = "SYCL backend: the batched prefill GEMM (oneMKL) is not ported yet";
-    return false;
-}
-void Gemm::bf16(const uint16_t*, const uint16_t*, float*, int64_t, int64_t, int64_t, int64_t, float) {
-    unported("Gemm::bf16");
-}
-void Gemm::f16(const uint16_t*, const uint16_t*, float*, int64_t, int64_t, int64_t, int64_t, float) {
-    unported("Gemm::f16");
-}
-void Gemm::native(const uint16_t*, int, const void*, float*, int64_t, int64_t, int64_t, int64_t, float) {
-    unported("Gemm::native");
-}
-void Gemm::rebind(uint16_t*, int64_t, void*, size_t) { unported("Gemm::rebind"); }
+// Init must succeed even when every prompt goes through the verify windows:
+// Prefill::init builds the Gemm at startup. The GEMM calls themselves still
+// throw until the oneMKL port lands (milestone 5).
+
 
 void gr_norm(const float*, const float*, float, float*, uint16_t*, int64_t, void*, uint16_t*) { unported("gr_norm"); }
 void gr_norm_rs(const float*, const float*, float, float*, uint16_t*, int64_t, void*, uint16_t*) {

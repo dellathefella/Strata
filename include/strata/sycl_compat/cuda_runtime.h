@@ -241,8 +241,11 @@ namespace strata::sycl_compat {
 inline cudaError_t host_alloc_impl(void** p, size_t n) {
     if (!p) return last_error() = cudaErrorInvalidValue;
     try {
-        // shared USM: host-writable and device-visible (the doorbell pattern)
-        *p = sycl::malloc_shared(n, default_queue());
+        // USM HOST: pinned host pages, device-visible over PCIe (the doorbell
+        // pattern). NOT malloc_shared: on discrete Arc a shared allocation can
+        // sit in device memory, and host syscalls (fread into a stage buffer)
+        // fault on it with EFAULT (measured: WeightTable::load short read).
+        *p = sycl::malloc_host(n, default_queue());
         if (!*p) return last_error() = cudaErrorMemoryAllocation;
     } catch (const sycl::exception& ex) {
         std::fprintf(stderr, "sycl_compat cudaHostAlloc: %s\n", ex.what());

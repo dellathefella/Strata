@@ -13,6 +13,8 @@
 
 namespace strata::kernels {
 namespace {
+constexpr float kIq4nlDequant[16] = {-127.f, -104.f, -83.f, -65.f, -49.f, -35.f, -22.f, -10.f,
+                                     1.f,    13.f,   25.f,  38.f,  53.f,  69.f,  89.f,  113.f};
 inline sycl::queue& Q(void* stream) { return strata::sycl_compat::q_for(stream); }
 
 // Q8_0 block: fp16 d then 32 int8 codes; value = code * d
@@ -25,7 +27,7 @@ inline void dequant_q8_0_f32(const uint8_t* src, int64_t n, float* dst, size_t i
 }
 }  // namespace
 
-bool embed_type_supported(int ggml_type) noexcept { return ggml_type == 8 || ggml_type == 30; }
+bool embed_type_supported(int ggml_type) noexcept { return ggml_type == 8 || ggml_type == 20 || ggml_type == 30; }
 
 void iq_dequant_f32(int ggml_type, const void* src, int64_t n, float* dst, void* stream) {
     if (n <= 0) return;
@@ -35,6 +37,15 @@ void iq_dequant_f32(int ggml_type, const void* src, int64_t n, float* dst, void*
     } else if (ggml_type == 30) {
         const uint16_t* h = static_cast<const uint16_t*>(src);
         Q(stream).parallel_for((size_t) n, [=](size_t i) { dst[i] = f32_from_bf16(h[i]); });
+    } else if (ggml_type == 20) {
+        const uint8_t* b = static_cast<const uint8_t*>(src);
+        Q(stream).parallel_for((size_t) n, [=](size_t i) {
+            const int64_t blk = i / 32;
+            const int j = (int) (i % 32);
+            const float d = f32_from_f16((uint16_t) b[blk * 18] | ((uint16_t) b[blk * 18 + 1] << 8));
+            const int nib = (j & 1) ? (b[blk * 18 + 2 + j / 2] >> 4) : (b[blk * 18 + 2 + j / 2] & 0x0f);
+            dst[i] = d * kIq4nlDequant[nib];
+        });
     } else {
         throw std::runtime_error("SYCL backend: iq_dequant_f32 for this GGML type is not ported yet");
     }
@@ -71,6 +82,17 @@ void iq_embed_rows(int ggml_type, const void* table, size_t row_bytes, const int
             const int64_t tok = tokens[id[0]];
             const uint16_t* row = reinterpret_cast<const uint16_t*>(t + (size_t) tok * row_bytes);
             out[(size_t) id[0] * n_embd + id[1]] = f32_from_bf16(row[id[1]]);
+        });
+    } else if (ggml_type == 20) {
+        Q(stream).parallel_for(sycl::range<2>((size_t) n_tok, (size_t) n_embd), [=](sycl::id<2> id) {
+            const int64_t tok = tokens[id[0]];
+            const uint8_t* row = t + (size_t) tok * row_bytes;
+            const int64_t i = id[1];
+            const int64_t blk = i / 32;
+            const int j = (int) (i % 32);
+            const float d = f32_from_f16((uint16_t) row[blk * 18] | ((uint16_t) row[blk * 18 + 1] << 8));
+            const int nib = (j & 1) ? (row[blk * 18 + 2 + j / 2] >> 4) : (row[blk * 18 + 2 + j / 2] & 0x0f);
+            out[(size_t) id[0] * n_embd + i] = d * kIq4nlDequant[nib];
         });
     } else {
         throw std::runtime_error("SYCL backend: iq_embed_rows for this GGML type is not ported yet");
