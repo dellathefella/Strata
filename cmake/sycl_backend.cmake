@@ -50,6 +50,7 @@ add_library(strata_kernels_sycl STATIC
   src/kernels/sycl/s2_gemv_fast.cpp
   src/kernels/sycl/dequant_s2.cpp
   src/kernels/sycl/bf16_gemv.cpp
+  src/kernels/sycl/native_bf16.cpp
   src/kernels/sycl/gdn.cpp)
 target_link_libraries(strata_kernels_sycl PUBLIC strata_sycl_runtime strata_warnings)
 

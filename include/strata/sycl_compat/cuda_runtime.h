@@ -52,8 +52,10 @@ struct stream_wrap {
     sycl::queue q;
     // non-null between cudaStreamBeginCapture and cudaStreamEndCapture
     std::unique_ptr<ex::command_graph<ex::graph_state::modifiable>> rec;
+    bool capturing = false;
     explicit stream_wrap(const sycl::device& d)
-        : q(d, sycl::property_list{sycl::property::queue::in_order{}}) {}
+        : q(d, sycl::property_list{sycl::property::queue::in_order{},
+                                   sycl::property::queue::enable_profiling{}}) {}
 };
 
 struct graph_wrap {
@@ -71,7 +73,8 @@ struct event_wrap {
 
 inline sycl::queue& default_queue() {
     static sycl::queue q(sycl::gpu_selector_v,
-                         sycl::property_list{sycl::property::queue::in_order{}});
+                         sycl::property_list{sycl::property::queue::in_order{},
+                                             sycl::property::queue::enable_profiling{}});
     return q;
 }
 
@@ -321,6 +324,7 @@ inline cudaError_t cudaStreamBeginCapture(cudaStream_t s, cudaStreamCaptureMode)
     try {
         s->rec = std::make_unique<ex::command_graph<ex::graph_state::modifiable>>(s->q);
         s->rec->begin_recording(s->q);
+        s->capturing = true;
     } catch (const sycl::exception& exn) {
         std::fprintf(stderr, "sycl_compat cudaStreamBeginCapture: %s\n", exn.what());
         return strata::sycl_compat::last_error() = cudaErrorUnknown;
@@ -333,6 +337,7 @@ inline cudaError_t cudaStreamEndCapture(cudaStream_t s, cudaGraph_t* graph) {
         return strata::sycl_compat::last_error() = cudaErrorInvalidValue;
     try {
         s->rec->end_recording();
+        s->capturing = false;
         *graph = new strata::sycl_compat::graph_wrap{std::move(s->rec)};
     } catch (const sycl::exception& exn) {
         std::fprintf(stderr, "sycl_compat cudaStreamEndCapture: %s\n", exn.what());
@@ -377,6 +382,18 @@ inline cudaError_t cudaGraphExecDestroy(cudaGraphExec_t exec) {
 
 inline cudaError_t cudaGraphDestroy(cudaGraph_t graph) {
     delete graph;
+    return cudaSuccess;
+}
+
+enum cudaStreamCaptureStatus {
+    cudaStreamCaptureStatusNone = 0,
+    cudaStreamCaptureStatusActive = 1,
+    cudaStreamCaptureStatusInvalidated = 2,
+};
+
+inline cudaError_t cudaStreamIsCapturing(cudaStream_t s, cudaStreamCaptureStatus* status) {
+    if (!status) return strata::sycl_compat::last_error() = cudaErrorInvalidValue;
+    *status = (s && s->capturing) ? cudaStreamCaptureStatusActive : cudaStreamCaptureStatusNone;
     return cudaSuccess;
 }
 
