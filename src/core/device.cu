@@ -8,6 +8,14 @@
 
 namespace strata::core {
 
+#if defined(STRATA_USE_SYCL)
+// icpx cannot parse <<<>>>; the poison fill is a plain SYCL kernel launched
+// through the compat queue (same NaN bit pattern, same semantics). Defined in
+// src/core/poison_sycl.cpp; declared here at namespace scope so it has
+// external linkage.
+void poison_fill(void* p, uint64_t n_floats);
+#endif
+
 namespace {
 
 void check(cudaError_t e, const char* what) {
@@ -19,10 +27,14 @@ void check(cudaError_t e, const char* what) {
 // A NaN pattern, not zero.  Zeros read from uninitialised memory are indistinguishable from real zeros in a
 // dequantized weight or a masked attention score, which is exactly the kind of wrong-but-plausible value the
 // Phase 1 harnesses kept catching.
+#if defined(STRATA_USE_SYCL)
+// (the fill itself lives in poison_sycl.cpp; see the declaration above)
+#else
 __global__ void poison_kernel(float* p, uint64_t n_floats) {
     const uint64_t i = (uint64_t) blockIdx.x * blockDim.x + threadIdx.x;
     if (i < n_floats) p[i] = __int_as_float(0x7fc00000);
 }
+#endif
 
 #if defined(STRATA_USE_HIP)
 #if !defined(STRATA_HIP_ARCHS)
@@ -123,6 +135,8 @@ std::string gpu_arch_problem(int ordinal) {
 std::string device_code_error() {
 #if defined(STRATA_USE_HIP)
     return "";   // gpu_arch_problem() checks the HIP architectures against STRATA_HIP_ARCHS, before this point
+#elif defined(STRATA_USE_SYCL)
+    return "";   // SYCL kernels are JITed at first launch; there is no per-arch code object to probe
 #else
     // every .cu of the engine is compiled for the same CMAKE_CUDA_ARCHITECTURES, so this kernel stands for all
     cudaFuncAttributes a{};
@@ -175,6 +189,10 @@ DeviceInfo device_info(int ordinal) {
 #if defined(STRATA_USE_HIP)
     d.arch = base_arch(p.gcnArchName);
     if (const std::string why = arch_problem(p, ordinal); !why.empty()) throw CudaError(why, -1);
+#elif defined(STRATA_USE_SYCL)
+    // the CC gate is an NVIDIA concept; the SYCL backend admits whatever the
+    // Level-Zero loader enumerates (kernel support is checked by the parity
+    // suite and the mx_caps bench, not by a capability number)
 #else
     // #236: the experimental build (-DSTRATA_EXPERIMENTAL_SM60=ON: Pascal sm_60, Volta sm_70) runs on the cards it
     // was built for - refusing them below 7.5 there made the flag useless; the release engine keeps 7.5
@@ -202,6 +220,10 @@ DeviceArena::DeviceArena(uint64_t bytes, int ordinal, bool poison)
     // happens once, here, before anything depends on it.
     check(cudaMalloc(&base_, (size_t) bytes), "cudaMalloc");
     if (poison_) {
+#if defined(STRATA_USE_SYCL)
+        poison_fill(base_, bytes / sizeof(float));
+        check(cudaDeviceSynchronize(), "poison sync");
+#else
         const int threads = 256;
         const uint64_t n = bytes / sizeof(float);
         const uint64_t blocks = (n + threads - 1) / threads;
@@ -214,6 +236,7 @@ DeviceArena::DeviceArena(uint64_t bytes, int ordinal, bool poison)
             check(cudaGetLastError(), "poison_kernel");
         }
         check(cudaDeviceSynchronize(), "poison sync");
+#endif
     }
 }
 

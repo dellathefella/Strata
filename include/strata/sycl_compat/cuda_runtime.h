@@ -14,15 +14,29 @@
 #include <sycl/ext/oneapi/experimental/graph.hpp>
 #include <sycl/sycl.hpp>
 
+#include <atomic>
 #include <cstddef>
 #include <cstdio>
 #include <memory>
+#include <mutex>
+#include <unordered_map>
 
 using cudaError_t = int;
 static constexpr cudaError_t cudaSuccess = 0;
 static constexpr cudaError_t cudaErrorMemoryAllocation = 2;
 static constexpr cudaError_t cudaErrorInvalidValue = 11;
+static constexpr cudaError_t cudaErrorNotReady = 600;
 static constexpr cudaError_t cudaErrorUnknown = 999;
+
+static constexpr unsigned cudaEventDefault = 0;
+static constexpr unsigned cudaEventBlockingSync = 1;
+static constexpr unsigned cudaEventDisableTiming = 2;
+static constexpr unsigned cudaEventInterprocess = 4;
+
+static constexpr unsigned cudaHostRegisterDefault = 0;
+static constexpr unsigned cudaHostRegisterPortable = 1;
+static constexpr unsigned cudaHostRegisterMapped = 2;
+static constexpr unsigned cudaHostRegisterIoMemory = 4;
 
 enum cudaMemcpyKind {
     cudaMemcpyHostToHost = 0,
@@ -110,11 +124,46 @@ inline cudaError_t cudaGetLastError() {
 inline cudaError_t cudaPeekAtLastError() { return strata::sycl_compat::last_error(); }
 
 namespace strata::sycl_compat {
+inline std::atomic<size_t>& allocated() {
+    static std::atomic<size_t> bytes{0};
+    return bytes;
+}
+inline size_t allocated_bytes() { return allocated().load(); }
+
+inline std::mutex& sizes_mutex() {
+    static std::mutex m;
+    return m;
+}
+inline std::unordered_map<void*, size_t>& sizes_map() {
+    static std::unordered_map<void*, size_t> sizes;
+    return sizes;
+}
+inline void remember_alloc(void* p, size_t n) {
+    {
+        std::lock_guard<std::mutex> g(sizes_mutex());
+        sizes_map()[p] = n;
+    }
+    allocated().fetch_add(n);
+}
+inline void forget_alloc(void* p) {
+    size_t n = 0;
+    {
+        std::lock_guard<std::mutex> g(sizes_mutex());
+        auto it = sizes_map().find(p);
+        if (it != sizes_map().end()) {
+            n = it->second;
+            sizes_map().erase(it);
+        }
+    }
+    allocated().fetch_sub(n);
+}
+
 inline cudaError_t malloc_impl(void** p, size_t n) {
     if (!p) return last_error() = cudaErrorInvalidValue;
     try {
         *p = sycl::malloc_device(n, default_queue());
         if (!*p) return last_error() = cudaErrorMemoryAllocation;
+        remember_alloc(*p, n);
     } catch (const sycl::exception& ex) {
         std::fprintf(stderr, "sycl_compat cudaMalloc: %s\n", ex.what());
         return last_error() = cudaErrorMemoryAllocation;
@@ -132,6 +181,7 @@ inline cudaError_t cudaMalloc(T** p, size_t n) {
 inline cudaError_t cudaFree(void* p) {
     if (!p) return cudaSuccess;
     try {
+        strata::sycl_compat::forget_alloc(p);
         sycl::free(p, strata::sycl_compat::default_queue());
     } catch (const sycl::exception& ex) {
         std::fprintf(stderr, "sycl_compat cudaFree: %s\n", ex.what());
@@ -283,8 +333,79 @@ inline cudaError_t cudaEventSynchronize(cudaEvent_t e) {
 inline cudaError_t cudaEventQuery(cudaEvent_t e) {
     // 0 = complete, 600 = not ready (cudaErrorNotReady)
     const auto st = e->e.get_info<sycl::info::event::command_execution_status>();
-    return st == sycl::info::event_command_status::complete ? cudaSuccess : 600;
+    return st == sycl::info::event_command_status::complete ? cudaSuccess : cudaErrorNotReady;
 }
+
+inline cudaError_t cudaEventRecord(cudaEvent_t e) { return cudaEventRecord(e, nullptr); }
+
+inline cudaError_t cudaStreamQuery(cudaStream_t s) {
+    // in-order queue: the engine uses this as a flush hint while host-spinning
+    // on the doorbell; SYCL needs no flush (submissions reach the driver eagerly).
+    (void) s;
+    return cudaSuccess;
+}
+
+inline cudaError_t cudaStreamWaitEvent(cudaStream_t s, cudaEvent_t e, unsigned = 0) {
+    if (!e) return strata::sycl_compat::last_error() = cudaErrorInvalidValue;
+    try {
+        // in-order queues serialize anyway; make the dependency explicit
+        strata::sycl_compat::q_for(s).submit(
+            [&](sycl::handler& h) { h.depends_on(e->e); h.single_task([]() {}); });
+    } catch (const sycl::exception& exn) {
+        std::fprintf(stderr, "sycl_compat cudaStreamWaitEvent: %s\n", exn.what());
+        return strata::sycl_compat::last_error() = cudaErrorUnknown;
+    }
+    return cudaSuccess;
+}
+
+inline cudaError_t cudaLaunchHostFunc(cudaStream_t s, void (*fn)(void*), void* arg) {
+    try {
+        strata::sycl_compat::q_for(s).submit([&](sycl::handler& h) {
+            h.host_task([fn, arg]() { fn(arg); });
+        });
+    } catch (const sycl::exception& exn) {
+        std::fprintf(stderr, "sycl_compat cudaLaunchHostFunc: %s\n", exn.what());
+        return strata::sycl_compat::last_error() = cudaErrorUnknown;
+    }
+    return cudaSuccess;
+}
+
+// row-major 2D copy with per-row pitch (USM: plain strided memcpy via a kernel)
+inline cudaError_t cudaMemcpy2DAsync(void* dst, size_t dpitch, const void* src,
+                                     size_t spitch, size_t width, size_t height,
+                                     cudaMemcpyKind, cudaStream_t s) {
+    try {
+        auto& q = strata::sycl_compat::q_for(s);
+        unsigned char* d = static_cast<unsigned char*>(dst);
+        const unsigned char* sr = static_cast<const unsigned char*>(src);
+        q.parallel_for(height, [=](size_t row) {
+             const unsigned char* s_row = sr + row * spitch;
+             unsigned char* d_row = d + row * dpitch;
+             for (size_t i = 0; i < width; ++i) d_row[i] = s_row[i];
+         })
+            .wait_and_throw();
+    } catch (const sycl::exception& exn) {
+        std::fprintf(stderr, "sycl_compat cudaMemcpy2DAsync: %s\n", exn.what());
+        return strata::sycl_compat::last_error() = cudaErrorUnknown;
+    }
+    return cudaSuccess;
+}
+
+inline cudaError_t cudaMemcpy2D(void* dst, size_t dpitch, const void* src, size_t spitch,
+                                size_t width, size_t height, cudaMemcpyKind k) {
+    return cudaMemcpy2DAsync(dst, dpitch, src, spitch, width, height, k, nullptr);
+}
+
+template <typename T>
+inline cudaError_t cudaMallocHost(T** p, size_t n) {
+    return strata::sycl_compat::host_alloc_impl(reinterpret_cast<void**>(p), n);
+}
+
+// USM host/shared memory is already registered and device-visible: no-ops.
+inline cudaError_t cudaHostRegister(void*, size_t, unsigned = cudaHostRegisterDefault) {
+    return cudaSuccess;
+}
+inline cudaError_t cudaHostUnregister(void*) { return cudaSuccess; }
 
 inline cudaError_t cudaEventElapsedTime(float* ms, cudaEvent_t a, cudaEvent_t b) {
     try {
@@ -307,6 +428,115 @@ inline cudaError_t cudaGetDevice(int* dev) {
 }
 
 inline cudaError_t cudaSetDevice(int) { return cudaSuccess; }
+
+static constexpr unsigned cudaDeviceScheduleSpin = 1;
+static constexpr unsigned cudaDeviceMapHost = 8;
+inline cudaError_t cudaInitDevice(int, unsigned, size_t) { return cudaSuccess; }
+
+// ---------------- device query (src/core/device.cu) -------------------------
+struct cudaDeviceProp {
+    char name[256] = {0};
+    int major = 9;             // the CC gate is bypassed under STRATA_USE_SYCL;
+    int minor = 0;             // these exist so host formatting code compiles
+    int multiProcessorCount = 0;
+    size_t totalGlobalMem = 0;
+    int warpSize = 32;         // Xe2 executes in SIMD32; the ported kernels use
+                               // per-32-lane local trees, not sub_group shuffles
+    char gcnArchName[64] = {0};
+};
+
+inline cudaError_t cudaGetDeviceCount(int* count) {
+    if (!count) return strata::sycl_compat::last_error() = cudaErrorInvalidValue;
+    try {
+        *count = (int) sycl::device::get_devices(sycl::info::device_type::gpu).size();
+        if (*count == 0) return strata::sycl_compat::last_error() = cudaErrorUnknown;
+    } catch (const sycl::exception& exn) {
+        std::fprintf(stderr, "sycl_compat cudaGetDeviceCount: %s\n", exn.what());
+        return strata::sycl_compat::last_error() = cudaErrorUnknown;
+    }
+    return cudaSuccess;
+}
+
+inline cudaError_t cudaGetDeviceProperties(cudaDeviceProp* p, int ordinal) {
+    if (!p) return strata::sycl_compat::last_error() = cudaErrorInvalidValue;
+    try {
+        const auto devs = sycl::device::get_devices(sycl::info::device_type::gpu);
+        if (ordinal < 0 || ordinal >= (int) devs.size())
+            return strata::sycl_compat::last_error() = cudaErrorInvalidValue;
+        const sycl::device& d = devs[ordinal];
+        const std::string nm = d.get_info<sycl::info::device::name>();
+        std::snprintf(p->name, sizeof(p->name), "%s", nm.c_str());
+        p->multiProcessorCount =
+            (int) d.get_info<sycl::info::device::max_compute_units>();
+        p->totalGlobalMem = d.get_info<sycl::info::device::global_mem_size>();
+    } catch (const sycl::exception& exn) {
+        std::fprintf(stderr, "sycl_compat cudaGetDeviceProperties: %s\n", exn.what());
+        return strata::sycl_compat::last_error() = cudaErrorUnknown;
+    }
+    return cudaSuccess;
+}
+
+// L0 exposes no free-memory query; track our own allocations (the engine takes
+// one big DeviceArena plus a handful of side buffers, so this is close).
+inline cudaError_t cudaMemGetInfo(size_t* free_b, size_t* total_b) {
+    try {
+        const sycl::device d = strata::sycl_compat::default_queue().get_device();
+        const size_t total = d.get_info<sycl::info::device::global_mem_size>();
+        const size_t used = strata::sycl_compat::allocated_bytes();
+        if (total_b) *total_b = total;
+        if (free_b) *free_b = total > used ? total - used : 0;
+    } catch (const sycl::exception& exn) {
+        std::fprintf(stderr, "sycl_compat cudaMemGetInfo: %s\n", exn.what());
+        return strata::sycl_compat::last_error() = cudaErrorUnknown;
+    }
+    return cudaSuccess;
+}
+
+inline cudaError_t cudaDriverGetVersion(int* v) {
+    if (v) *v = 12000;
+    return cudaSuccess;
+}
+inline cudaError_t cudaRuntimeGetVersion(int* v) {
+    if (v) *v = 12000;
+    return cudaSuccess;
+}
+
+struct cudaFuncAttributes {
+    int numRegs = 0;
+    size_t sharedSizeBytes = 0;
+    size_t localSizeBytes = 0;
+    int maxThreadsPerBlock = 1024;
+};
+template <typename F>
+inline cudaError_t cudaFuncGetAttributes(cudaFuncAttributes* a, F) {
+    if (!a) return strata::sycl_compat::last_error() = cudaErrorInvalidValue;
+    *a = cudaFuncAttributes{};
+    return cudaSuccess;
+}
+
+enum cudaDeviceAttr {
+    cudaDevAttrMultiProcessorCount = 16,
+    cudaDevAttrClockRate = 13,
+};
+inline cudaError_t cudaDeviceGetAttribute(int* value, cudaDeviceAttr attr, int) {
+    if (!value) return strata::sycl_compat::last_error() = cudaErrorInvalidValue;
+    try {
+        const sycl::device d = strata::sycl_compat::default_queue().get_device();
+        switch (attr) {
+            case cudaDevAttrMultiProcessorCount:
+                *value = (int) d.get_info<sycl::info::device::max_compute_units>();
+                break;
+            case cudaDevAttrClockRate:
+                *value = (int) d.get_info<sycl::info::device::max_clock_frequency>() * 1000;
+                break;
+            default:
+                *value = 0;
+        }
+    } catch (const sycl::exception&) {
+        *value = 0;
+    }
+    return cudaSuccess;
+}
 
 // ---------------- CUDA graphs on SYCL experimental command graphs -----------
 using cudaGraph_t = strata::sycl_compat::graph_wrap*;
@@ -358,6 +588,39 @@ inline cudaError_t cudaGraphInstantiate(cudaGraphExec_t* exec, cudaGraph_t graph
         std::fprintf(stderr, "sycl_compat cudaGraphInstantiate: %s\n", exn.what());
         return strata::sycl_compat::last_error() = cudaErrorUnknown;
     }
+    return cudaSuccess;
+}
+
+// the 5-arg CUDA <=11 spelling still used by graph.cpp / verify.cpp
+inline cudaError_t cudaGraphInstantiate(cudaGraphExec_t* exec, cudaGraph_t graph,
+                                        void*, void*, size_t) {
+    return cudaGraphInstantiate(exec, graph, 0ull);
+}
+
+// node enumeration: the engine only needs the COUNT (graph.cpp refuses
+// zero-node captures); verify.cpp's per-node listing is CUDA/HIP-only and
+// stays guarded out under STRATA_USE_SYCL.
+using cudaGraphNode_t = void*;
+enum cudaGraphNodeType {
+    cudaGraphNodeTypeKernel = 0,
+    cudaGraphNodeTypeMemcpy = 1,
+    cudaGraphNodeTypeMemset = 2,
+};
+
+inline cudaError_t cudaGraphGetNodes(cudaGraph_t graph, cudaGraphNode_t* nodes,
+                                     size_t* numNodes) {
+    if (!graph || !numNodes) return strata::sycl_compat::last_error() = cudaErrorInvalidValue;
+    size_t n = 0;
+    try {
+        n = graph->g->get_nodes().size();
+    } catch (const sycl::exception& exn) {
+        std::fprintf(stderr, "sycl_compat cudaGraphGetNodes: %s\n", exn.what());
+        return strata::sycl_compat::last_error() = cudaErrorUnknown;
+    }
+    if (nodes) {
+        for (size_t i = 0; i < n; ++i) nodes[i] = reinterpret_cast<cudaGraphNode_t>(i + 1);
+    }
+    *numNodes = n;
     return cudaSuccess;
 }
 

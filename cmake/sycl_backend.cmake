@@ -54,7 +54,9 @@ add_library(strata_kernels_sycl STATIC
   src/kernels/sycl/native_gr_norm.cpp
   src/kernels/sycl/native_gr_postops.cpp
   src/kernels/sycl/gdn.cpp
-  src/kernels/sycl/gr.cpp)
+  src/kernels/sycl/gr.cpp
+  src/kernels/sycl/verify_kernels.cpp
+  src/kernels/sycl/fused_gr.cpp)
 target_link_libraries(strata_kernels_sycl PUBLIC strata_sycl_runtime strata_warnings)
 
 # ---- parity gates: the CUDA parity tests, compiled unmodified against the shim ----
@@ -122,3 +124,41 @@ target_compile_options(mx_caps PRIVATE -fsycl -O2)
 target_link_options(mx_caps PRIVATE -fsycl)
 
 message(STATUS "Strata: SYCL enabled (kernels: quantize_act, s2_gemv_q8, s_gemv/s_gemv_split)")
+
+# ---- engine bring-up on SYCL (milestone 2) ----------------------------------
+# The main CMakeLists gates strata_core / strata_kernels / strata_engine behind
+# CUDA|HIP. Under SYCL the same target names are defined HERE: the two runtime
+# .cu files are host-shaped enough to compile as C++ against the sycl_compat
+# shim (device.cu's single <<<>>> poison fill lives in poison_sycl.cpp), and
+# strata_kernels is the ported SYCL kernel library under its CUDA name so the
+# engine's link line is backend-neutral. Link failures against this alias are
+# the kernel port worklist (docs/SYCL_PORT.md milestone 3+).
+set_source_files_properties(
+  ${CMAKE_CURRENT_SOURCE_DIR}/src/core/device.cu
+  ${CMAKE_CURRENT_SOURCE_DIR}/src/core/pinned.cu
+  PROPERTIES LANGUAGE CXX)
+
+add_library(strata_core STATIC
+  src/core/device.cu src/core/pinned.cu src/platform/memory.cpp
+  src/core/graph.cpp src/core/weights.cpp src/core/layout.cpp
+  src/core/poison_sycl.cpp)
+target_include_directories(strata_core PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/include)
+target_link_libraries(strata_core PUBLIC strata_plan strata_warnings strata_sycl_runtime)
+
+add_library(strata_kernels ALIAS strata_kernels_sycl)
+
+add_executable(strata-device src/core/device_main.cpp)
+target_link_libraries(strata-device PRIVATE strata_core)
+
+add_executable(strata-load src/core/load_main.cpp)
+target_link_libraries(strata-load PRIVATE strata_core strata_kernels)
+
+add_library(strata_engine STATIC
+  src/core/layer.cpp src/core/session.cpp src/core/expert_source.cpp
+  src/core/remote_experts.cpp src/core/expert_cache.cpp src/core/native_head.cpp
+  src/core/native_dense.cpp src/core/verify.cpp src/core/mtp.cpp
+  src/core/conversation_snapshot.cpp src/core/conversation_state.cpp
+  src/core/conversation_memory.cpp)
+target_include_directories(strata_engine PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/include)
+target_link_libraries(strata_engine PUBLIC strata_core strata_kernels strata_kernels_cpu
+                                            strata_sycl_runtime)

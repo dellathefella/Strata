@@ -863,7 +863,13 @@ if(STRATA_NATIVE_EXPERTS)
   # one-pass static linking has no cycle to resolve)
   target_sources(strata_kernels_cpu PRIVATE src/kernels/cpu/native_expert.cpp src/kernels/cpu/iq_avx512.cpp
                                            src/kernels/cpu/iq_avx2.cpp src/kernels/cpu/kq_avx2.cpp)
-  target_include_directories(strata_kernels_cpu PRIVATE third_party/ggml)
+  # third_party/ggml is vendored in some checkouts; fall back to the fetched
+  # llama.cpp ggml sources (ggml-common.h lives in ggml/src) when absent
+  if(EXISTS ${CMAKE_CURRENT_SOURCE_DIR}/third_party/ggml/ggml-common.h)
+    target_include_directories(strata_kernels_cpu PRIVATE third_party/ggml)
+  else()
+    target_include_directories(strata_kernels_cpu PRIVATE ${strata_llamacpp_SOURCE_DIR}/ggml/src)
+  endif()
   if(MSVC)
     set_source_files_properties(src/kernels/cpu/iq_avx512.cpp PROPERTIES COMPILE_OPTIONS "/arch:AVX512")
     set_source_files_properties(src/kernels/cpu/iq_avx2.cpp PROPERTIES COMPILE_OPTIONS "/arch:AVX2")
