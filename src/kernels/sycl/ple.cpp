@@ -158,6 +158,11 @@ void ple_block(const float* emb, const float* hidden, const float* hist_rows, co
         std::exit(1);
     }
     const size_t float_bytes = (size_t) (5 * hc_dim + n_embd + hc) * sizeof(float);
+    auto dbg_sync = [&](const char* n) {
+        if (std::getenv("STRATA_PLE_SYNC_EACH") == nullptr) return;
+        const cudaError_t e = cudaStreamSynchronize((cudaStream_t) stream);
+        std::fprintf(stderr, "[dbg] ple sync %-14s %s\n", n, cudaGetErrorString(e));
+    };
     const size_t q8_bytes = (size_t) (n_embd / 32) * 34;
     uint8_t* base = (uint8_t*) scratch;
     float* d_scratch = (float*) base;
@@ -180,10 +185,12 @@ void ple_block(const float* emb, const float* hidden, const float* hist_rows, co
         quantize_q8_0(emb, d_act, n_embd, stream);
         s2_gemv_q8(d_act, w.key_codes, w.key_scales, d_key, n_embd, hc_dim, 8, stream);
     }
+    dbg_sync("keyproj");
     if (!native_postops) {
         gnorm_launch(d_key, w.norm_key, d_key, n_embd, hc, NG_RMS_EPS, stream);
         gnorm_launch(hidden, w.norm_query, d_query, n_embd, hc, NG_RMS_EPS, stream);
     }
+    dbg_sync("gnorms");
     if (native_bf16) {
         bf16_gemv_fp32_mmvf(emb, w.value_bf16, d_value, n_embd, n_embd, stream);
     } else {
@@ -197,6 +204,7 @@ void ple_block(const float* emb, const float* hidden, const float* hist_rows, co
         });
     }
 
+    dbg_sync("value");
     const float* normalized_key = d_key;
     if (native_postops) {
         NativePlePostopsBuffers buffers{d_query, d_norm, d_gate, d_gated, d_norm, d_conv, out.result};
@@ -205,8 +213,12 @@ void ple_block(const float* emb, const float* hidden, const float* hist_rows, co
     } else {
         gate_launch(d_key, d_query, d_gate, n_embd, hc, 1.0f / sycl::sqrt((float) n_embd), stream);
         const size_t total = (size_t) hc_dim;
+        gate_launch(d_key, d_query, d_gate, n_embd, hc, 1.0f / sycl::sqrt((float) n_embd), stream);
+        dbg_sync("gate");
         Q(stream).parallel_for(total, [=](size_t i) { d_gated[i] = d_value[i % n_embd] * d_gate[i / n_embd]; });
+        dbg_sync("bcast");
         gnorm_launch(d_gated, w.norm_conv, d_norm, n_embd, hc, NG_RMS_EPS, stream);
+        dbg_sync("gnorm3");
         Q(stream).parallel_for(total, [=](size_t c) {
             float acc = 0.0f;
             for (int k = 0; k < PLE_CONV_KERNEL; ++k) {
@@ -216,10 +228,12 @@ void ple_block(const float* emb, const float* hidden, const float* hist_rows, co
             }
             d_conv[c] = acc / (1.0f + sycl::exp(-acc));
         });
+        dbg_sync("conv");
         Q(stream).parallel_for(total,
                                [=](size_t i) { out.result[i] = hidden[i] + d_gated[i] + d_conv[i]; });
     }
 
+    dbg_sync("add3");
     if (out.key) ck(stream, cudaMemcpyAsync(out.key, normalized_key, hc_dim * sizeof(float), cudaMemcpyDeviceToDevice,
                                             (cudaStream_t) stream), "key");
     if (out.value)
@@ -237,6 +251,7 @@ void ple_block(const float* emb, const float* hidden, const float* hist_rows, co
     if (out.conv)
         ck(stream, cudaMemcpyAsync(out.conv, d_conv, hc_dim * sizeof(float), cudaMemcpyDeviceToDevice,
                                    (cudaStream_t) stream), "conv");
+    dbg_sync("export");
     ck(stream, cudaGetLastError(), "launch");
 }
 

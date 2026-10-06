@@ -71,6 +71,7 @@ add_library(strata_kernels_sycl STATIC
   src/kernels/sycl/kv_stream.cpp
   src/kernels/sycl/qsa.cpp
   src/kernels/sycl/qsa_decode_attn.cpp
+  src/kernels/sycl/s2_expert_grouped.cpp
   src/kernels/sycl/native_mmvq.cpp
   src/kernels/sycl/stubs_not_ported.cpp
   src/kernels/sycl/sampler.cpp
@@ -114,6 +115,11 @@ target_link_libraries(gdn_parity_sycl PRIVATE strata_kernels_sycl strata_sycl_ru
 
 add_executable(quantize_act_parity_sycl src/kernels/quantize_act_parity.cpp)
 target_link_libraries(quantize_act_parity_sycl PRIVATE strata_kernels_sycl strata_sycl_runtime)
+
+foreach(parity_extra IN ITEMS s2_expert_grouped native_expert qsa iq iq_multi mmvq_multi ple ple_fp8 ple_q5 gr kv_stream sampler decode_cluster cvec q5_projection s_gemv_q8k kv_q4 kv_q8 kv_hybrid)
+  add_executable(${parity_extra}_parity_sycl src/kernels/${parity_extra}_parity.cpp)
+  target_link_libraries(${parity_extra}_parity_sycl PRIVATE strata_kernels_sycl strata_sycl_runtime)
+endforeach()
 # Two icpx host-codegen quirks, both measured (dbg repros in the port log):
 #   1. -O1..-O3 inline+fold `want[i] = x[i]*s` into a 1-ulp-off double-rounded
 #      constant (466/1024 false diffs vs the IEEE-exact device kernel);
@@ -145,6 +151,12 @@ target_compile_options(q4q8_kernel_bench PRIVATE -fsycl -O2)
 target_link_options(q4q8_kernel_bench PRIVATE -fsycl)
 
 add_executable(mx_caps tools/mx_caps.cpp)
+add_executable(l0_graph_probe tools/l0_graph_probe.cpp)
+add_executable(l0_engine_probe tools/l0_engine_probe.cpp)
+add_executable(l0_mmap_probe tools/l0_mmap_probe.cpp)
+target_link_libraries(l0_mmap_probe PRIVATE strata_sycl_runtime)
+target_link_libraries(l0_engine_probe PRIVATE strata_kernels_sycl strata_sycl_runtime)
+target_link_libraries(l0_graph_probe PRIVATE strata_sycl_runtime)
 target_compile_options(mx_caps PRIVATE -fsycl -O2)
 target_link_options(mx_caps PRIVATE -fsycl)
 
@@ -195,7 +207,7 @@ target_link_libraries(strata_engine PUBLIC strata_core strata_kernels strata_ker
 add_library(strata_prefill STATIC src/prefill/prefill.cpp src/prefill/sycl_stub.cpp src/prefill/gemm_sycl.cpp)
 target_include_directories(strata_prefill PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/include)
 target_link_libraries(strata_prefill PUBLIC strata_engine strata_sycl_runtime)
-target_link_options(strata_prefill PUBLIC -lonemkl)
+target_link_options(strata_prefill PUBLIC -lmkl_sycl_blas -lmkl_intel_ilp64 -lmkl_gnu_thread -lmkl_core -lgomp)
 
 add_executable(strata src/program/generate.cpp)
 target_include_directories(strata PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/include)

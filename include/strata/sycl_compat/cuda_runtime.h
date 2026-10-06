@@ -16,9 +16,12 @@
 
 #include <atomic>
 #include <cstddef>
+#include <functional>
+#include <vector>
 #include <cstdio>
 #include <memory>
 #include <mutex>
+#include <algorithm>
 #include <unordered_map>
 
 using cudaError_t = int;
@@ -96,6 +99,44 @@ inline sycl::queue& q_for(void* stream) {
     return stream ? static_cast<stream_wrap*>(stream)->q : default_queue();
 }
 
+// Registry of every created stream, so a legacy-default-stream sync can stand
+// in for CUDA's implicit device-wide ordering: the engine queues expert-slot
+// refills on stream 0 and waits there, while prefill/work streams still read
+// those slots.  CUDA's legacy default stream serialises with blocking
+// streams; independent in-order SYCL queues do not, so stream-0 syncs must
+// drain every queue.
+inline std::mutex& streams_mutex() {
+    static std::mutex m;
+    return m;
+}
+inline std::vector<stream_wrap*>& stream_registry() {
+    static std::vector<stream_wrap*> v;
+    return v;
+}
+inline cudaError_t sync_all_queues() {
+    cudaError_t first = cudaSuccess;
+    try {
+        default_queue().wait_and_throw();
+    } catch (const sycl::exception& ex) {
+        std::fprintf(stderr, "sycl_compat sync_all: %s\n", ex.what());
+        first = cudaErrorUnknown;
+    }
+    std::vector<stream_wrap*> copy;
+    {
+        std::lock_guard<std::mutex> lk(streams_mutex());
+        copy = stream_registry();
+    }
+    for (stream_wrap* w : copy) {
+        try {
+            w->q.wait_and_throw();
+        } catch (const sycl::exception& ex) {
+            std::fprintf(stderr, "sycl_compat sync_all: %s\n", ex.what());
+            first = cudaErrorUnknown;
+        }
+    }
+    return first;
+}
+
 inline cudaError_t& last_error() {
     thread_local cudaError_t e = cudaSuccess;
     return e;
@@ -138,6 +179,12 @@ inline std::unordered_map<void*, size_t>& sizes_map() {
     static std::unordered_map<void*, size_t> sizes;
     return sizes;
 }
+inline void dump_allocations() {
+    std::lock_guard<std::mutex> lk(strata::sycl_compat::sizes_mutex());
+    auto& m = strata::sycl_compat::sizes_map();
+    std::fprintf(stderr, "[alloc-map] %zu entries\n", m.size());
+    for (auto& kv : m) std::fprintf(stderr, "[alloc-map] %p + %zu\n", kv.first, kv.second);
+}
 inline void remember_alloc(void* p, size_t n) {
     {
         std::lock_guard<std::mutex> g(sizes_mutex());
@@ -164,6 +211,10 @@ inline cudaError_t malloc_impl(void** p, size_t n) {
         *p = sycl::malloc_device(n, default_queue());
         if (!*p) return last_error() = cudaErrorMemoryAllocation;
         remember_alloc(*p, n);
+        // STRATA_ZERO_ALLOCS=1: zero every device allocation (debug: makes any
+        // read-of-uninitialised-memory deterministic instead of run-history noise)
+        static const bool zero = std::getenv("STRATA_ZERO_ALLOCS") != nullptr;
+        if (zero) default_queue().memset(*p, 0, n).wait_and_throw();
     } catch (const sycl::exception& ex) {
         std::fprintf(stderr, "sycl_compat cudaMalloc: %s\n", ex.what());
         return last_error() = cudaErrorMemoryAllocation;
@@ -191,6 +242,12 @@ inline cudaError_t cudaFree(void* p) {
 }
 
 inline cudaError_t cudaMemcpy(void* dst, const void* src, size_t n, cudaMemcpyKind) {
+    // CUDA's synchronous memcpy is device-ordered: it cannot overlap ANY
+    // stream's work.  The default queue alone knows nothing about the other
+    // in-order queues, so drain them first (a refill must not race an
+    // undrained prefill/MTP stream that still reads the lent slots).
+    const cudaError_t drained = strata::sycl_compat::last_error() = strata::sycl_compat::sync_all_queues();
+    if (drained != cudaSuccess) return drained;
     try {
         strata::sycl_compat::default_queue()
             .memcpy(dst, const_cast<void*>(src), n)
@@ -247,6 +304,7 @@ inline cudaError_t host_alloc_impl(void** p, size_t n) {
         // fault on it with EFAULT (measured: WeightTable::load short read).
         *p = sycl::malloc_host(n, default_queue());
         if (!*p) return last_error() = cudaErrorMemoryAllocation;
+        remember_alloc(*p, n);
     } catch (const sycl::exception& ex) {
         std::fprintf(stderr, "sycl_compat cudaHostAlloc: %s\n", ex.what());
         return last_error() = cudaErrorMemoryAllocation;
@@ -269,19 +327,17 @@ inline cudaError_t cudaHostGetDevicePointer(void** dev, void* host, unsigned /*f
 }
 
 inline cudaError_t cudaDeviceSynchronize() {
-    try {
-        strata::sycl_compat::default_queue().wait_and_throw();
-    } catch (const sycl::exception& ex) {
-        std::fprintf(stderr, "sycl_compat cudaDeviceSynchronize: %s\n", ex.what());
-        return strata::sycl_compat::last_error() = cudaErrorUnknown;
-    }
-    return strata::sycl_compat::last_error() = cudaSuccess;
+    return strata::sycl_compat::last_error() = strata::sycl_compat::sync_all_queues();
 }
 
 inline cudaError_t cudaStreamCreate(cudaStream_t* s) {
     try {
         *s = new strata::sycl_compat::stream_wrap(
             strata::sycl_compat::default_queue().get_device());
+        {
+            std::lock_guard<std::mutex> lk(strata::sycl_compat::streams_mutex());
+            strata::sycl_compat::stream_registry().push_back(*s);
+        }
     } catch (const sycl::exception& ex) {
         std::fprintf(stderr, "sycl_compat cudaStreamCreate: %s\n", ex.what());
         return strata::sycl_compat::last_error() = cudaErrorUnknown;
@@ -296,11 +352,19 @@ inline cudaError_t cudaStreamCreateWithFlags(cudaStream_t* s, unsigned /*flags*/
 inline cudaError_t cudaStreamDestroy(cudaStream_t s) {
     if (!s) return cudaSuccess;
     s->q.wait_and_throw();
+    {
+        std::lock_guard<std::mutex> lk(strata::sycl_compat::streams_mutex());
+        auto& reg = strata::sycl_compat::stream_registry();
+        reg.erase(std::remove(reg.begin(), reg.end(), s), reg.end());
+    }
     delete s;
     return cudaSuccess;
 }
 
 inline cudaError_t cudaStreamSynchronize(cudaStream_t s) {
+    // stream 0 is the LEGACY default stream: its syncs stand in for CUDA's
+    // implicit device-wide ordering (see sync_all_queues)
+    if (s == nullptr) return strata::sycl_compat::last_error() = strata::sycl_compat::sync_all_queues();
     try {
         strata::sycl_compat::q_for(s).wait_and_throw();
     } catch (const sycl::exception& ex) {
@@ -385,12 +449,13 @@ inline cudaError_t cudaMemcpy2DAsync(void* dst, size_t dpitch, const void* src,
         auto& q = strata::sycl_compat::q_for(s);
         unsigned char* d = static_cast<unsigned char*>(dst);
         const unsigned char* sr = static_cast<const unsigned char*>(src);
+        // enqueue only: this call runs inside graph capture, where waiting on
+        // the capturing queue is illegal (UR_RESULT_ERROR_DEVICE_LOST path)
         q.parallel_for(height, [=](size_t row) {
-             const unsigned char* s_row = sr + row * spitch;
-             unsigned char* d_row = d + row * dpitch;
-             for (size_t i = 0; i < width; ++i) d_row[i] = s_row[i];
-         })
-            .wait_and_throw();
+            const unsigned char* s_row = sr + row * spitch;
+            unsigned char* d_row = d + row * dpitch;
+            for (size_t i = 0; i < width; ++i) d_row[i] = s_row[i];
+        });
     } catch (const sycl::exception& exn) {
         std::fprintf(stderr, "sycl_compat cudaMemcpy2DAsync: %s\n", exn.what());
         return strata::sycl_compat::last_error() = cudaErrorUnknown;
@@ -449,6 +514,7 @@ struct cudaDeviceProp {
     size_t totalGlobalMem = 0;
     int warpSize = 32;         // Xe2 executes in SIMD32; the ported kernels use
                                // per-32-lane local trees, not sub_group shuffles
+    int l2CacheSize = 0;       // not exposed by SYCL; consumers treat 0 as "unknown"
     char gcnArchName[64] = {0};
 };
 
@@ -665,6 +731,19 @@ inline cudaError_t cudaStreamIsCapturing(cudaStream_t s, cudaStreamCaptureStatus
     if (!status) return strata::sycl_compat::last_error() = cudaErrorInvalidValue;
     *status = (s && s->capturing) ? cudaStreamCaptureStatusActive : cudaStreamCaptureStatusNone;
     return cudaSuccess;
+}
+
+// ---- segmented capture (SYCL-only verify-window replay) -------------------
+// When seg_sink is non-null, the doorbell wait kernels (verify_kernels.cpp)
+// END the current capture at each wait and BEGIN a fresh one instead of
+// recording an on-device spin: L0 replays of the monolithic ~700-node window
+// graph with in-graph spins stall the card, and xe's job timeout then wedges
+// it. The host launches the segments interleaved with its expert-pool feeds.
+namespace strata::sycl_compat {
+inline std::vector<cudaGraph_t>* seg_sink = nullptr;
+// Eager window mode: the doorbell waits become host sync + feed callback
+// (set by Verifier::run for one window); no graphs, no on-device spins.
+inline std::function<bool(uint32_t)> eager_feed;
 }
 
 // Math spellings: Strata's portable HD headers call the C names (cosf, ...).

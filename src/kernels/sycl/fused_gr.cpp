@@ -213,13 +213,15 @@ void gr_up(const FusedGrArgs& a, void* stream) {
 
 // ---- multi: step 1, per-token norm into the global xn scratch ----
 void gr_norm_multi(const FusedGrArgs* a, int T, float* xn, void* stream) {
+    FusedGrArgs av[kFusedGrMaxT];
+    for (int i = 0; i < kFusedGrMaxT; ++i) av[i] = a[i < T ? i : 0];
     Q(stream).submit([&](sycl::handler& hnd) {
         local_accessor<float, 2> part(sycl::range<2>(WARPS, HC), hnd);
         local_accessor<float, 1> s_rs(sycl::range<1>(HC), hnd);
         local_accessor<float, 1> red(sycl::range<1>(THREADS), hnd);
         hnd.parallel_for(sycl::nd_range<1>(sycl::range<1>((size_t) T * THREADS), sycl::range<1>(THREADS)),
                          [=](nd_item<1> it) {
-                             const FusedGrArgs& aa = a[it.get_group(0)];
+                             const FusedGrArgs& aa = av[it.get_group(0)];
                              float* my_xn = xn + it.get_group(0) * (size_t) D;
                              const int t = (int) it.get_local_id(0);
                              const int lane = t & 31, warp = t >> 5;
@@ -262,6 +264,8 @@ void gr_norm_multi(const FusedGrArgs* a, int T, float* xn, void* stream) {
 
 // ---- multi: step 2, tiled down projection over all T tokens ----
 void gr_down_multi(const FusedGrArgs* a, int T, const float* xn, void* stream) {
+    FusedGrArgs av[kFusedGrMaxT];
+    for (int i = 0; i < kFusedGrMaxT; ++i) av[i] = a[i < T ? i : 0];
     Q(stream).submit([&](sycl::handler& hnd) {
         local_accessor<float, 1> tile(sycl::range<1>(kFusedGrMaxT * TILEV), hnd);
         local_accessor<float, 1> red(sycl::range<1>(THREADS), hnd);
@@ -274,9 +278,9 @@ void gr_down_multi(const FusedGrArgs* a, int T, const float* xn, void* stream) {
                              const bool inject_block = bx == DOWN_BLOCKS;
                              const int row = inject_block ? warp : bx * WARPS + warp;
                              const bool active =
-                                 !(inject_block && (a[0].w_inject == nullptr || warp >= HC));
+                                 !(inject_block && (av[0].w_inject == nullptr || warp >= HC));
                              const uint16_t* wrow =
-                                 (inject_block ? a[0].w_inject : a[0].w_down) +
+                                 (inject_block ? av[0].w_inject : av[0].w_down) +
                                  (size_t) (active ? row : 0) * D;
                              float acc[kFusedGrMaxT];
 #pragma unroll
@@ -310,19 +314,23 @@ void gr_down_multi(const FusedGrArgs* a, int T, const float* xn, void* stream) {
                                          if (k < T) acc[k] += dot8(wv[q], &tile[k * TILEV + j * 8]);
                                  }
                              }
+                             // EVERY warp reduces on EVERY k slot: the tree carries
+                             // work-group barriers, so the call count must not depend
+                             // on `active` or on k < T (a mismatch here deadlocked the
+                             // group; the unbounded spin then tripped the xe job
+                             // timeout and wedged the card)
                              float s[kFusedGrMaxT];
 #pragma unroll
                              for (int k = 0; k < kFusedGrMaxT; ++k)
-                                 s[k] = (k < T && active) ? warp_sum(acc[k], t, red, it)
-                                                          : (active ? 0.0f : warp_sum(0.0f, t, red, it));
+                                 s[k] = warp_sum(active && k < T ? acc[k] : 0.0f, t, red, it);
 #pragma unroll
                              for (int k = 0; k < kFusedGrMaxT; ++k) {
-                                 if (k >= T || lane != k) continue;
+                                 if (!active || k >= T || lane != k) continue;
                                  if (inject_block) {
-                                     a[k].inject_out[row] = s[k];
+                                     av[k].inject_out[row] = s[k];
                                  } else {
                                      const float x = s[k] / (float) HC;
-                                     a[k].lo[row] = x / (1.0f + sycl::exp(-x));
+                                     av[k].lo[row] = x / (1.0f + sycl::exp(-x));
                                  }
                              }
                          });
@@ -332,6 +340,8 @@ void gr_down_multi(const FusedGrArgs* a, int T, const float* xn, void* stream) {
 
 // ---- multi: step 3, up projection with per-lane token epilogues ----
 void gr_up_multi(const FusedGrArgs* a, int T, void* stream) {
+    FusedGrArgs av[kFusedGrMaxT];
+    for (int i = 0; i < kFusedGrMaxT; ++i) av[i] = a[i < T ? i : 0];
     Q(stream).submit([&](sycl::handler& hnd) {
         local_accessor<float, 2> lo(sycl::range<2>(kFusedGrMaxT, LR), hnd);
         local_accessor<float, 3> g(sycl::range<3>(kFusedGrMaxT, HC, UPM_COLS), hnd);
@@ -342,11 +352,11 @@ void gr_up_multi(const FusedGrArgs* a, int T, void* stream) {
                              const int t = (int) it.get_local_id(0);
                              const int lane = t & 31, warp = t >> 5;
                              const int d0 = bx * UPM_COLS;
-                             for (int i = t; i < T * LR; i += THREADS) lo[i / LR][i % LR] = a[i / LR].lo[i % LR];
+                             for (int i = t; i < T * LR; i += THREADS) lo[i / LR][i % LR] = av[i / LR].lo[i % LR];
                              it.barrier(sycl::access::fence_space::local_space);
                              for (int r = warp; r < HC * UPM_COLS; r += WARPS) {
                                  const int c = r / UPM_COLS, dd = r - c * UPM_COLS, i = c * N + d0 + dd;
-                                 const uint16_t* wrow = a[0].w_up + (size_t) i * LR;
+                                 const uint16_t* wrow = av[0].w_up + (size_t) i * LR;
                                  uint32_t wa[4], wb[4];
 #pragma unroll
                                  for (int e = 0; e < 4; ++e) wa[e] = bf16_pair(wrow, lane * 8 + e * 2);
@@ -359,7 +369,7 @@ void gr_up_multi(const FusedGrArgs* a, int T, void* stream) {
                                  float rv = 0.0f, wn = 0.0f, rsc = 0.0f, bo = 0.0f, ip = 0.0f;
                                  bool apply = false;
                                  if (lane < T) {
-                                     const FusedGrArgs& aa = a[lane];
+                                     const FusedGrArgs& aa = av[lane];
                                      rv = aa.R[i];
                                      wn = aa.w_norm[i];
                                      rsc = aa.rs[c];
@@ -381,7 +391,7 @@ void gr_up_multi(const FusedGrArgs* a, int T, void* stream) {
                                  if (lane < T) {
                                      if (apply) {
                                          rv = sycl::fma(bo, 2.0f * sigmoidf_(ip / (float) HC), rv);
-                                         a[lane].R_out[i] = rv;
+                                         av[lane].R_out[i] = rv;
                                      }
                                      const float x = rv * wn * rsc;
                                      g[lane][c][dd] = x * sigmoidf_(mine);
@@ -393,7 +403,7 @@ void gr_up_multi(const FusedGrArgs* a, int T, void* stream) {
                                  float s = 0.0f;
 #pragma unroll
                                  for (int c = 0; c < HC; ++c) s += g[k][c][col];
-                                 a[k].mixed[d0 + col] = s / (float) HC;
+                                 av[k].mixed[d0 + col] = s / (float) HC;
                              }
                          });
     });
@@ -416,12 +426,21 @@ void fused_gr_read_multi(const FusedGrArgs* a, int n_tok, float* xn_scratch, voi
         std::fprintf(stderr, "fused_gr_read_multi: n_tok %d out of range\n", n_tok);
         std::exit(1);
     }
+    static const bool fdbg = std::getenv("STRATA_FGR_SYNC") != nullptr;
+    auto fsync = [&](const char* n) {
+        if (!fdbg) return;
+        const cudaError_t e = cudaStreamSynchronize((cudaStream_t) stream);
+        std::fprintf(stderr, "[dbg] fgr %-9s %s\n", n, cudaGetErrorString(e));
+    };
     if (stamp_buf) gpu_stamp(stamp_buf, stamp_i0, stream);
     gr_norm_multi(a, n_tok, xn_scratch, stream);
+    fsync("norm");
     if (stamp_buf) gpu_stamp(stamp_buf, stamp_i0 + 1, stream);
     gr_down_multi(a, n_tok, xn_scratch, stream);
+    fsync("down");
     if (stamp_buf) gpu_stamp(stamp_buf, stamp_i0 + 2, stream);
     gr_up_multi(a, n_tok, stream);
+    fsync("up");
     if (stamp_buf) gpu_stamp(stamp_buf, stamp_i0 + 3, stream);
 }
 

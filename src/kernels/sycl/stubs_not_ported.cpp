@@ -44,21 +44,6 @@ void shared_expert(const uint8_t*, const uint8_t*, const uint16_t*, const SForm&
 void moe_combine(const float*, const float*, const float*, float*, int64_t, int64_t, void*) {
     unported("moe_combine");
 }
-uint64_t moe_hit_grouped_scratch_bytes(int64_t, int64_t, int64_t) { unported("moe_hit_grouped_scratch_bytes"); }
-void moe_hit_grouped_s2(const uint8_t*, const int32_t*, const int32_t*, int64_t, int64_t, const uint8_t*, void*,
-                        float*, void*, const float*) {
-    unported("moe_hit_grouped_s2");
-}
-void moe_hit_select(const int32_t*, const int32_t*, int, int, int32_t*, int32_t*, int32_t*, void*) {
-    unported("moe_hit_select");
-}
-void moe_hit_grouped_s2_dev(const uint8_t*, const int32_t*, const int32_t*, const int32_t*, int64_t, int64_t,
-                            const uint8_t*, void*, float*, void*, const float*) {
-    unported("moe_hit_grouped_s2_dev");
-}
-void moe_hit_add(float*, const float*, const int32_t*, const int32_t*, int64_t, int64_t, void*) {
-    unported("moe_hit_add");
-}
 void moe_grouped_s2(const unsigned long long*, const int32_t*, const int32_t*, const int32_t*, const int32_t*, int64_t,
                     int64_t, const uint8_t*, const float*, void*, float*, void*) {
     unported("moe_grouped_s2");
@@ -66,9 +51,6 @@ void moe_grouped_s2(const unsigned long long*, const int32_t*, const int32_t*, c
 void moe_group_resident(const int32_t*, int, int, const uint8_t*, int64_t, unsigned long long*, int32_t*, int32_t*,
                         int32_t*, int32_t*, void*) {
     unported("moe_group_resident");
-}
-void moe_hit_select_multi(const int32_t*, const int32_t*, int, int, int32_t*, int32_t*, int32_t*, void*) {
-    unported("moe_hit_select_multi");
 }
 
 // ---- native (GGUF-block) grouped experts + iq dequant/embed ----

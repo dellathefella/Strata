@@ -109,10 +109,11 @@ void kv_gather_q8_step(const int8_t* k_q, const int8_t* v_q, const uint16_t* k_s
     const int head_dim = (int) s.head_dim;
     const int page_size = (int) s.page_size;
     const int per = head_dim / 4;
-    const long long n_ids = (long long) step[kStepWidth];
-    const long long total = n_ids * kv_heads * (long long) per;
-    if (total <= 0) return;
-    Q(stream).parallel_for((size_t) total, [=](size_t i) {
+    // the width lives in DEVICE memory (step[kStepWidth]): size the launch with
+    // max_ids and cull inside, exactly as the CUDA kernel does
+    Q(stream).parallel_for((size_t) max_ids * kv_heads * (long long) per, [=](size_t i) {
+        const long long n_ids = (long long) step[kStepWidth];
+        if ((long long) i >= n_ids * kv_heads * (long long) per) return;
         const long long id = (long long) i / (kv_heads * (long long) per);
         const int rem = (int) (i % (kv_heads * (long long) per));
         const int h = rem / per, q4 = rem - h * per;

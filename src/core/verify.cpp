@@ -174,6 +174,11 @@ Verifier::~Verifier() {
     if (cs_) cudaStreamSynchronize(cs_);
     for (auto& e : exec_)
         if (e) cudaGraphExecDestroy(e);
+#if defined(STRATA_USE_SYCL)
+    for (auto& v : seg_exec_)
+        for (auto e : v)
+            if (e) cudaGraphExecDestroy(e);
+#endif
     if (commit_exec_) cudaGraphExecDestroy(commit_exec_);
     if (cs_) cudaStreamDestroy(cs_);
     if (copy_) { cudaStreamSynchronize(copy_); cudaStreamDestroy(copy_); }
@@ -402,7 +407,14 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
     auto Rt = [&](int t) { return R_ + (size_t) t * HC * N; };
     const int G = (split_ && T >= 2) ? 2 : 1;
     static const bool dec_batch = [] { const char* v = std::getenv("STRATA_DEC_BATCH"); return v == nullptr || std::atoi(v) != 0; }();
-    auto stamp = [&](int64_t l, int i, int grp) { if (prof_on_ && grp == 0) gpu_stamp(prof_, (int) (l * kProfPer + i), cs); };
+    auto stamp = [&](int64_t l, int i, int grp) {
+        if (prof_on_ && grp == 0) gpu_stamp(prof_, (int) (l * kProfPer + i), cs);
+        static const bool win_sync = std::getenv("STRATA_WIN_SYNC") != nullptr;
+        if (win_sync && grp == 0) {
+            const cudaError_t e = cudaStreamSynchronize(cs);
+            std::fprintf(stderr, "[dbg] win sync l=%lld i=%d -> %s\n", (long long) l, i, cudaGetErrorString(e));
+        }
+    };
     const int tb_[2] = {0, (T + 1) / 2}, te_[2] = {G == 2 ? (T + 1) / 2 : T, T};
     groups_[T] = G;
 
@@ -643,6 +655,33 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
                 // KV streaming: the n selections' blocks resident (device-side, inside the graph)
                 qsa_kv_resolve(st, *g_, sel_ + (size_t) tb * cap_, step_ + tb * kStepCount, n, cap_, cs);
                 stamp(l, 12, grp);
+                if (std::getenv("STRATA_QSA_DUMP")) {
+                    cudaStreamSynchronize(cs);
+                    std::vector<int32_t> selh((size_t) n * cap_), sth((size_t) n * kStepCount);
+                    cudaMemcpy(selh.data(), sel_ + (size_t) tb * cap_, (size_t) n * cap_ * 4, cudaMemcpyDeviceToHost);
+                    cudaMemcpy(sth.data(), step_ + (size_t) tb * kStepCount, (size_t) n * kStepCount * 4, cudaMemcpyDeviceToHost);
+                    for (int t = 0; t < n; ++t) {
+                        int lo = INT32_MAX, hi = INT32_MIN;
+                        for (int c = 0; c < cap_; ++c) { const int32_t v = selh[(size_t) t * cap_ + c]; lo = v < lo ? v : lo; hi = v > hi ? v : hi; }
+                        std::fprintf(stderr, "[qsa] l=%lld grp=%d t=%d n_ids=%d sel min=%d max=%d max_cells=%lld first8:",
+                                     (long long) l, grp, t, sth[(size_t) t * kStepCount + kStepWidth], lo, hi, (long long) st.max_cells);
+                        for (int c = 0; c < 8 && c < cap_; ++c) std::fprintf(stderr, " %d", selh[(size_t) t * cap_ + c]);
+                        std::fprintf(stderr, "\n");
+                    }
+                    {
+                        const QsaAttnPools pp = qsa_attn_pools(st);
+                        int32_t pt[16] = {};
+                        cudaMemcpy(pt, pp.page_table, sizeof pt, cudaMemcpyDeviceToHost);
+                        std::fprintf(stderr, "[qsa] pools k=%p v=%p kq=%p vq=%p kq4=%p pt=%p page_size=%lld n_head=%lld n_head_kv=%lld pt[0..7]:",
+                                     (const void*) pp.k_pool, (const void*) pp.v_pool, (const void*) pp.k_q,
+                                     (const void*) pp.v_q, (const void*) pp.k_q4, (const void*) pp.page_table,
+                                     (long long) s.page_size, (long long) s.n_head, (long long) s.n_head_kv);
+                        for (int i = 0; i < 8; ++i) std::fprintf(stderr, " %d", pt[i]);
+                        std::fprintf(stderr, " scratch=%p attn=%p qcur=%p\n",
+                                     (void*) (attn_scratch_ + (size_t) tb * attn_scratch_floats_),
+                                     (void*) (attn_ + tb * NH * HD), (void*) (qcur_ + tb * NH * HD));
+                    }
+                }
                 const QsaAttnPools pools = qsa_attn_pools(st);
                 qsa_decode_attn_batch(qcur_ + tb * NH * HD, pools, sel_ + (size_t) tb * cap_, step_ + tb * kStepCount, cap_,
                                       s, attn_scratch_ + (size_t) tb * attn_scratch_floats_, attn_ + tb * NH * HD, n, cs);
@@ -886,14 +925,30 @@ std::string Verifier::profile_report() {
 
 bool Verifier::capture(int T, std::string& err) {
     if (exec_[T] != nullptr) return true;
+#if defined(STRATA_USE_SYCL)
+    // eager window mode: nothing is captured; run() executes record_window
+    // directly with host feeds at the doorbell points
+    (void) T;
+    (void) err;
+    return true;
+#endif
     if (cudaStreamBeginCapture(cs_, cudaStreamCaptureModeThreadLocal) != cudaSuccess) {
         err = "verify: begin capture failed";
         return false;
     }
+#if defined(STRATA_USE_SYCL)
+    std::vector<cudaGraph_t> seg_graphs;
+    strata::sycl_compat::seg_sink = &seg_graphs;
+#endif
     std::string rerr;
     const bool ok = record_window(T, cs_, rerr);
     cudaGraph_t graph = nullptr;
     const cudaError_t ce = cudaStreamEndCapture(cs_, &graph);
+#if defined(STRATA_USE_SYCL)
+    strata::sycl_compat::seg_sink = nullptr;
+    if (ok && ce == cudaSuccess) seg_graphs.push_back(graph);
+    std::fprintf(stderr, "[dbg] record done ok=%d ce=%d segments=%zu\n", (int) ok, (int) ce, seg_graphs.size());
+#endif
     if (!ok) {
         if (graph) cudaGraphDestroy(graph);
         err = rerr;
@@ -935,20 +990,44 @@ bool Verifier::capture(int T, std::string& err) {
     }
 #endif
     const cudaError_t ie = cudaGraphInstantiate(&exec_[T], graph, 0);
+#if defined(STRATA_USE_SYCL)
+    // the graph is owned by seg_graphs (instantiated again below as the last
+    // segment); destroying it here leaves the segment list dangling
+    (void) ie;
+#else
     cudaGraphDestroy(graph);
+#endif
     if (ie != cudaSuccess) {
         err = std::string("verify: instantiate: ") + cudaGetErrorString(ie);
         return false;
     }
+#if defined(STRATA_USE_SYCL)
+    size_t si = 0;
+    for (cudaGraph_t g : seg_graphs) {
+        std::fprintf(stderr, "[dbg] instantiating segment %zu\n", si++);
+        cudaGraphExec_t ex = nullptr;
+        if (cudaGraphInstantiate(&ex, g, 0) != cudaSuccess) {
+            err = "verify: segment instantiate failed";
+            return false;
+        }
+        seg_exec_[T].push_back(ex);
+        cudaGraphDestroy(g);
+    }
+    cudaGraphExecDestroy(exec_[T]);
+    exec_[T] = nullptr;
+    std::fprintf(stderr, "strata verify: captured the %d-token window as %zu SYCL segments\n", T,
+                 seg_exec_[T].size());
+    return true;
+#else
     const cudaError_t ue = cudaGraphUpload(exec_[T], cs_);
     const cudaError_t us = cudaStreamSynchronize(cs_);
     std::fprintf(stderr, "strata verify: captured the %d-token window (upload %s, sync %s)\n", T,
                  cudaGetErrorString(ue), cudaGetErrorString(us));
     return true;
+#endif
 }
 
-bool Verifier::capture_commit(std::string& err) {
-    if (commit_exec_ != nullptr) return true;
+bool Verifier::record_commit(std::string& err) {
     using namespace strata::kernels;
     const ModelGeometry& g = *g_;
     SessionState& ss = *ss_;
@@ -958,10 +1037,6 @@ bool Verifier::capture_commit(std::string& err) {
                                 (uint64_t) g.ssm_conv_channels * (g.ssm_d_conv - 1);
     const int64_t TS = (s.idx_block - 1) * ID;
     const int64_t HS = (int64_t) NG_HIST * NG_HC_DIM;
-    if (cudaStreamBeginCapture(cs_, cudaStreamCaptureModeThreadLocal) != cudaSuccess) {
-        err = "verify: begin commit capture failed";
-        return false;
-    }
     bool ok = true;
     try {
         copy_i32_from_mapped(commit_, m_commit_, 2 + MT, cs_);
@@ -998,6 +1073,20 @@ bool Verifier::capture_commit(std::string& err) {
         err = std::string("verify commit: ") + e.what();
         ok = false;
     }
+    return ok;
+}
+
+bool Verifier::capture_commit(std::string& err) {
+    if (commit_exec_ != nullptr) return true;
+#if defined(STRATA_USE_SYCL)
+    (void) err;
+    return true;  // the commit kernels run eagerly from commit()
+#else
+    if (cudaStreamBeginCapture(cs_, cudaStreamCaptureModeThreadLocal) != cudaSuccess) {
+        err = "verify: begin commit capture failed";
+        return false;
+    }
+    const bool ok = record_commit(err);
     cudaGraph_t graph = nullptr;
     const cudaError_t ce = cudaStreamEndCapture(cs_, &graph);
     if (!ok) {
@@ -1006,11 +1095,12 @@ bool Verifier::capture_commit(std::string& err) {
     }
     if (ce != cudaSuccess || cudaGraphInstantiate(&commit_exec_, graph, 0) != cudaSuccess) {
         if (graph) cudaGraphDestroy(graph);
-        err = std::string("verify: commit capture: ") + cudaGetErrorString(ce);
+        err = "verify: commit capture: " + cudaGetErrorString(ce);
         return false;
     }
     cudaGraphDestroy(graph);
     return true;
+#endif
 }
 
 bool Verifier::run(int T, const int32_t* tokens, int64_t pos0, PoolMultiFn pool, void* user, int32_t* out,
@@ -1055,16 +1145,70 @@ bool Verifier::run(int T, const int32_t* tokens, int64_t pos0, PoolMultiFn pool,
     for (int t = 0; t < T; ++t) last_tokens_[t] = tokens[t];
     ms_host += ms_since(t0);
     VDBG("staged; launching\n");
-    const cudaError_t le = cudaGraphLaunch(exec_[T], cs_);
-    if (le != cudaSuccess) { err = std::string("verify: launch: ") + cudaGetErrorString(le); return false; }
-    (void) cudaStreamQuery(cs_);
-    VDBG("launched\n");
     volatile uint32_t* const seq = h_seq_;
     volatile uint32_t* const flag = h_flag_;
     const int G = groups_[T] > 0 ? groups_[T] : 1;
     const int gtb[2] = {0, (T + 1) / 2}, gte[2] = {G == 2 ? (T + 1) / 2 : T, T};
     const int64_t steps = (le_ - lb_) * G;
     const bool test_stall = g_test_stall > 0 && windows + 1 == g_test_stall;   // #267 test hook (off: false)
+
+#if defined(STRATA_USE_SYCL)
+    // EAGER WINDOW: record_window executes directly on cs_; each doorbell
+    // wait becomes a stream sync + host feed callback (sycl_compat
+    // eager_feed), so no on-device spin kernels and no graph replay — both
+    // of which wedge xe's job timeout on Arc.
+    {
+        static thread_local uint32_t last_want = 0;
+        static thread_local int phase = 0;
+        last_want = 0;
+        phase = 0;
+        strata::sycl_compat::eager_feed = [&](uint32_t want) -> bool {
+            const int64_t k = (int64_t) want - 1;
+            if (want != last_want) { last_want = want; phase = 0; }
+            const int64_t l = lb_ + k / G;
+            const int grp = (int) (k % G);
+            if (phase == 0) {
+                const int tb = gtb[grp], n = gte[grp] - gtb[grp];
+                if (pool != nullptr)
+                    pool(user, h_x_ + (size_t) tb * g.n_embd, h_ids_ + (size_t) tb * ss.k, n, ss.k,
+                         h_ymiss_ + (size_t) tb * ss.k * g.n_embd, l);
+                std::atomic_thread_fence(std::memory_order_seq_cst);
+                _mm_sfence();
+                if (*(volatile uint32_t*) h_flagA_ != want) {
+                    sink_.counts[0] = 0;
+                    sink_.counts[1] = 0;
+                    sink_.counts[2] = 0;
+                    sink_.start[0] = 0;
+                    sink_.start2[0] = 0;
+                    std::atomic_thread_fence(std::memory_order_seq_cst);
+                    *(volatile uint32_t*) h_flagA_ = want;
+                }
+                phase = 1;
+            } else if (phase == 1) {
+                // the PCIe share lands in staging by DMA on copy_ (fetch_dma);
+                // in eager mode nothing else waits for that stream, so drain it
+                // before flag B releases the kernels that read the staging
+                if (copy_) cudaStreamSynchronize(copy_);
+                raise_flag(h_flagB_, want);
+                phase = 2;
+            } else {
+                if (!(test_stall && k + 1 == steps)) *flag = want;
+                phase = 0;
+            }
+            return true;
+        };
+        std::string rerr;
+        const bool okw = record_window(T, cs_, rerr);
+        strata::sycl_compat::eager_feed = nullptr;
+        if (!okw) { err = rerr; return false; }
+        if (cudaStreamSynchronize(cs_) != cudaSuccess) { err = "verify: eager window sync failed"; return false; }
+    }
+#else
+    const cudaError_t le = cudaGraphLaunch(exec_[T], cs_);
+    if (le != cudaSuccess) { err = "verify: launch: " + std::string(cudaGetErrorString(le)); return false; }
+    (void) cudaStreamQuery(cs_);
+    VDBG("launched\n");
+
     for (int64_t k = 0; k < steps; ++k) {
         const int64_t l = lb_ + k / G;
         const int grp = (int) (k % G);
@@ -1079,8 +1223,10 @@ bool Verifier::run(int T, const int32_t* tokens, int64_t pos0, PoolMultiFn pool,
             const auto now = Clock::now();
             if (now - last_flush > std::chrono::microseconds(2000)) {
                 last_flush = now;
-                const cudaError_t q = cudaStreamQuery(cs_);
                 if (q != cudaErrorNotReady && *seq < want) {
+                    std::fprintf(stderr,
+                                 *seq, *flag, *(volatile uint32_t*) h_flagA_, *(volatile uint32_t*) h_flagB_,
+                                 skip_[0], skip_[1], (uint32_t) (k + 1));
                     err = "verify: layer " + std::to_string(l) + " never rang (" +
                           (q == cudaSuccess ? std::string("graph finished") : std::string(cudaGetErrorString(q))) + ")";
                     return false;
@@ -1119,7 +1265,9 @@ bool Verifier::run(int T, const int32_t* tokens, int64_t pos0, PoolMultiFn pool,
         ms_wait += std::chrono::duration<double, std::milli>(b - a).count();
         ms_pool += ms_since(b);
     }
-    progress_at("verify window: waiting for the GPU to finish the window (flags A/B/M raised)", (int64_t) T);
+#endif
+
+        progress_at("verify window: waiting for the GPU to finish the window (flags A/B/M raised)", (int64_t) T);
     // #267: a window the GPU never finishes (a spin kernel that never sees its flag) holds the host here; the stall
     // watchdog then releases every verifier's GPU waits (release_live_verifiers) before it ends the engine, so no
     // spin kernel outlives the process - the case that left Windows GPUs "lost" until a power cycle.  The wait
@@ -1325,8 +1473,13 @@ bool Verifier::commit(int n_keep, std::string& err) {
     h_commit_[1] = n_keep - 1;
     for (int t = 0; t < max_t_; ++t) h_commit_[2 + t] = t < n_keep ? (int32_t) (last_pos0_ + t) : -1;
     std::atomic_thread_fence(std::memory_order_seq_cst);
+#if defined(STRATA_USE_SYCL)
+    if (!record_commit(err)) return false;   // eager: the commit kernels run now
+    const cudaError_t le = cudaSuccess;
+#else
     const cudaError_t le = cudaGraphLaunch(commit_exec_, cs_);
     if (le != cudaSuccess) { err = std::string("verify: commit launch: ") + cudaGetErrorString(le); return false; }
+#endif
     // set_commit_async: no wait here - the next window runs on the same stream after it, and the drafter (its own
     // stream) reads only this window's final rows and its own K/V. h_commit_ is next written after the next window's
     // results are read, i.e. after this graph has run.  Everything else waits on commit_done_ (wait_commit).

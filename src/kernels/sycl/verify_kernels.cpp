@@ -293,7 +293,39 @@ void gdn_step_norm_multi(float* state, const float* h, int conv_channels, const 
     check_launch(stream, "gdn_step_norm_multi");
 }
 
+namespace {
+// Under segmented capture a wait is a CUT, not a kernel: end the current
+// graph, hand it to the sink, and start recording the next segment. Outside
+// capture (eager parity runs) keep the spin kernel so semantics match CUDA.
+bool eager_wait(uint32_t value, void* stream) {
+    auto feed = strata::sycl_compat::eager_feed;
+    if (!feed) return false;
+    // The feed callback reads mapped buffers that the kernels queued so far
+    // write (R rows, flags).  Those submissions are asynchronous: drain the
+    // queue first, or the host consumes stale/garbage data (crash in the
+    // expert pool with garbage job counts).
+    if (stream) cudaStreamSynchronize((cudaStream_t) stream);
+    else cudaDeviceSynchronize();
+    return feed(value);
+}
+
+bool segment_cut(void* stream) {
+    auto* sink = strata::sycl_compat::seg_sink;
+    if (!sink) return false;
+    cudaStream_t s = static_cast<cudaStream_t>(stream);
+    cudaStreamCaptureStatus st = cudaStreamCaptureStatusNone;
+    cudaStreamIsCapturing(s, &st);
+    if (st != cudaStreamCaptureStatusActive) return false;
+    cudaGraph_t g = nullptr;
+    if (cudaStreamEndCapture(s, &g) != cudaSuccess) return false;
+    sink->push_back(g);
+    return cudaStreamBeginCapture(s, cudaStreamCaptureModeThreadLocal) == cudaSuccess;
+}
+}  // namespace
+
 void wait_flag_ge(const uint32_t* flag, uint32_t value, void* stream) {
+    if (eager_wait(value, stream)) return;
+    if (segment_cut(stream)) return;
     Q(stream).single_task([=] {
         while (ld_u32_mapped(flag) < value) strata_spin_pause();
         sycl::atomic_fence(memory_order::acquire, memory_scope::system);
@@ -302,6 +334,8 @@ void wait_flag_ge(const uint32_t* flag, uint32_t value, void* stream) {
 }
 
 void wait_flag_ge_or(const uint32_t* flag, uint32_t value, const uint32_t* skip, void* stream) {
+    if (eager_wait(value, stream)) return;
+    if (segment_cut(stream)) return;
     Q(stream).single_task([=] {
         if (ld_u32_mapped(skip) == value) return;
         while (ld_u32_mapped(flag) < value) strata_spin_pause();
@@ -318,7 +352,13 @@ void resident_plan(const int32_t* ids, int n_entries, int k, const int32_t* res_
                    const uint8_t* cache_base, const unsigned long long* slot_off, long long blob, int32_t* plan,
                    long long capx, uint32_t* skip, uint32_t ring, void* stream) {
     const int n = n_entries;
+    const bool force_skip = std::getenv("STRATA_HIT_SKIP") != nullptr;
     Q(stream).single_task([=] {
+        if (force_skip) {
+            sycl::atomic_fence(memory_order::release, memory_scope::system);
+            st_u32_mapped(skip, 0);
+            return;
+        }
         for (int i = 0; i < n; ++i) {
             const int32_t e = ids[i];
             if (e < 0 || e >= n_expert || res_layer[e] < 0) {
@@ -362,7 +402,10 @@ void resident_plan(const int32_t* ids, int n_entries, int k, const int32_t* res_
         sycl::atomic_fence(memory_order::release, memory_scope::system);
         st_u32_mapped(skip, ring, true);
     });
-    check_launch(stream, "resident_plan");
+    if (std::getenv("STRATA_HIT_SYNC")) {
+        const cudaError_t e = cudaDeviceSynchronize();
+        std::fprintf(stderr, "[dbg] hit %-10s %s\n", "resident_plan", cudaGetErrorString(e));
+    }
 }
 
 void copy_i32_from_mapped_unless(int32_t* dst, const int32_t* src, long long n, const uint32_t* skip, uint32_t value,

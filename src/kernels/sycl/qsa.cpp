@@ -494,11 +494,11 @@ void qsa_attend_step(const float* q, const uint16_t* k_scratch, const uint16_t* 
                              mx = chunk_max(mx, d, red, it);
                              if (lane == 0) redw[wid] = mx;
                              it.barrier(sycl::access::fence_space::local_space);
-                             if (wid == 0) {
-                                 mx = (lane < nwarp) ? redw[lane] : -FLT_MAX;
-                                 mx = chunk_max(mx, lane, red, it);
-                                 if (lane == 0) redw[0] = mx;
-                             }
+                             // EVERY warp runs the second-level tree: its
+                             // barriers are work-group-wide (warp-0-only here
+                             // deadlocked the group at replay)
+                             mx = chunk_max(wid == 0 && lane < nwarp ? redw[lane] : -FLT_MAX, d, red, it);
+                             if (d == 0) redw[0] = mx;
                              it.barrier(sycl::access::fence_space::local_space);
                              mx = redw[0];
                              it.barrier(sycl::access::fence_space::local_space);
@@ -511,11 +511,8 @@ void qsa_attend_step(const float* q, const uint16_t* k_scratch, const uint16_t* 
                              sum = chunk_sum(sum, d, red, it);
                              if (lane == 0) redw[wid] = sum;
                              it.barrier(sycl::access::fence_space::local_space);
-                             if (wid == 0) {
-                                 sum = (lane < nwarp) ? redw[lane] : 0.0f;
-                                 sum = chunk_sum(sum, lane, red, it);
-                                 if (lane == 0) redw[0] = 1.0f / sum;
-                             }
+                             sum = chunk_sum(wid == 0 && lane < nwarp ? redw[lane] : 0.0f, d, red, it);
+                             if (d == 0) redw[0] = 1.0f / sum;
                              it.barrier(sycl::access::fence_space::local_space);
                              const float inv = redw[0];
                              it.barrier(sycl::access::fence_space::local_space);

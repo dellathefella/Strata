@@ -183,6 +183,8 @@ private:
     void* next_user_ = nullptr;
     bool ple_stage() const { return lb_ <= 1 && 1 < le_; }   ///< holds layer 1, where the PLE block runs
     bool capture_commit(std::string& err);
+    /// the commit window's kernel sequence, eager (SYCL) or inside a capture (CUDA/HIP)
+    bool record_commit(std::string& err);
     bool record_window(int T, cudaStream_t cs, std::string& err);
     static constexpr int kProfPer = 33;              // stamps per layer (32 left the hc-read second
                                       // half's up-stamp at slot 32 = the next layer's slot 0: D8)
@@ -204,6 +206,11 @@ private:
     int64_t n_vocab_ = 0;
     cudaStream_t cs_ = nullptr;
     cudaGraphExec_t exec_[9] = {};
+#if defined(STRATA_USE_SYCL)
+    // segmented replay: one executable graph per doorbell wait cut (see
+    // sycl_compat seg_sink); the host launches them interleaved with feeds
+    std::vector<cudaGraphExec_t> seg_exec_[9];
+#endif
     cudaGraphExec_t commit_exec_ = nullptr;
 
     // mapped staging (host pointer, device alias)

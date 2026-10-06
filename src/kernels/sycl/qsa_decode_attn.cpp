@@ -147,6 +147,7 @@ void attn_chunk_launch(const float* q, const QsaAttnPools& p, const int32_t* ids
                              }
                          });
     });
+    if (std::getenv("STRATA_QSA_SYNC")) { cudaStreamSynchronize((cudaStream_t) stream); std::fprintf(stderr, "[qsa-sync] scores ok\n"); }
     // ---- per-head chunk max + exp-sum over the 64 cells ----
     Q(stream).submit([&](sycl::handler& hnd) {
         local_accessor<float, 1> red(sycl::range<1>(32), hnd);
@@ -183,6 +184,7 @@ void attn_chunk_launch(const float* q, const QsaAttnPools& p, const int32_t* ids
                              }
                          });
     });
+    if (std::getenv("STRATA_QSA_SYNC")) { cudaStreamSynchronize((cudaStream_t) stream); std::fprintf(stderr, "[qsa-sync] expsum ok\n"); }
     // ---- value accumulate: one thread per (q, kvh, chunk, head, dim) ----
     Q(stream).parallel_for(sycl::range<1>((size_t) n_q * n_kv_heads * n_chunks * G * HD), [=](size_t i) {
         const int d = (int) (i % HD);
@@ -225,7 +227,7 @@ void attn_chunk_launch(const float* q, const QsaAttnPools& p, const int32_t* ids
             }
             acc = sycl::fma(wgt, v, acc);
         }
-        part_acc[((size_t) qz * scratch_stride + (size_t) slot * G + h) * HD + d] = acc;
+        part_acc[(size_t) qz * scratch_stride + ((size_t) slot * G + h) * HD + d] = acc;
     });
 }
 
@@ -278,6 +280,12 @@ void qsa_decode_attn_batch(const float* q, const QsaAttnPools& pools, const int3
     const size_t sp_need = (size_t) n_q * n_chunks * CHUNK * G * s.n_head;
     static float* sp_buf = nullptr;
     static size_t sp_cap = 0;
+    if (std::getenv("STRATA_QSA_SYNC")) {
+        static bool dumped = false;
+        std::fprintf(stderr, "[qsa-sync] batch n_q=%lld cap=%lld chunks=%d sp_need=%zu sp_buf=%p\n",
+                     (long long) n_q, (long long) cap, n_chunks, sp_need, (void*) sp_buf);
+        if (!dumped) { dumped = true; strata::sycl_compat::dump_allocations(); }
+    }
     if (sp_need > sp_cap) {
         if (sp_buf) cudaFree(sp_buf);
         if (cudaMalloc(&sp_buf, sp_need * sizeof(float)) != cudaSuccess) {
@@ -302,7 +310,9 @@ void qsa_decode_attn_batch(const float* q, const QsaAttnPools& pools, const int3
     else
         attn_chunk_launch<0>(q, pools, ids, steps, kv_heads, page_size, scale, part_acc, part_m, part_l, n_chunks,
                              (int) cap, stride, (int) n_q, sp_glob, stream);
+    if (std::getenv("STRATA_QSA_SYNC")) { cudaStreamSynchronize((cudaStream_t) stream); std::fprintf(stderr, "[qsa-sync] value ok\n"); }
     attn_merge_launch(part_acc, part_m, part_l, n_chunks, attn, stride, (int) s.n_head, (int) n_q, stream);
+    if (std::getenv("STRATA_QSA_SYNC")) { cudaStreamSynchronize((cudaStream_t) stream); std::fprintf(stderr, "[qsa-sync] merge ok\n"); }
     const cudaError_t e = cudaGetLastError();
     if (e != cudaSuccess) {
         std::fprintf(stderr, "qsa_decode_attn_batch: %s\n", cudaGetErrorString(e));

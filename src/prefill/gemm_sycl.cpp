@@ -11,6 +11,9 @@
 #include <cuda_runtime.h>  // sycl_compat shim
 
 #include <oneapi/mkl.hpp>
+#include <sycl/ext/oneapi/bfloat16.hpp>
+
+using BF16 = sycl::ext::oneapi::bfloat16;
 
 #include <cstdio>
 #include <cstdlib>
@@ -20,12 +23,13 @@ namespace {
 
 inline sycl::queue& Q(void* stream) { return strata::sycl_compat::q_for(stream); }
 
-template <typename T>
-void gemm_tn(void* stream, const T* X, const T* W, float* Y, int64_t T, int64_t N, int64_t K, int64_t ldy,
+template <typename HT>
+void gemm_tn(void* stream, const HT* X, const HT* W, float* Y, int64_t Tn, int64_t N, int64_t K, int64_t ldy,
              float beta) {
     const float alpha = 1.0f;
     oneapi::mkl::blas::column_major::gemm(Q(stream), oneapi::mkl::transpose::trans,
-                                          oneapi::mkl::transpose::nontrans, N, T, K, alpha, W, K, X, K, beta, Y, ldy);
+                                          oneapi::mkl::transpose::nontrans, N, Tn, K, alpha, W, K, X, K, beta, Y,
+                                          ldy);
 }
 
 }  // namespace
@@ -72,16 +76,16 @@ void Gemm::bf16(const uint16_t* X, const uint16_t* W, float* Y, int64_t T, int64
                 float beta) {
     if (T <= 0 || N <= 0) return;
     if (ldy <= 0) ldy = N;
-    gemm_tn<sycl::bfloat16>(stream_, reinterpret_cast<const sycl::bfloat16*>(X),
-                            reinterpret_cast<const sycl::bfloat16*>(W), Y, T, N, K, ldy, beta);
+    gemm_tn<BF16>(stream_, reinterpret_cast<const BF16*>(X), reinterpret_cast<const BF16*>(W), Y, T, N, K,
+                        ldy, beta);
 }
 
 void Gemm::f16(const uint16_t* X, const uint16_t* W, float* Y, int64_t T, int64_t N, int64_t K, int64_t ldy,
                float beta) {
     if (T <= 0 || N <= 0) return;
     if (ldy <= 0) ldy = N;
-    gemm_tn<sycl::half>(stream_, reinterpret_cast<const sycl::half*>(X), reinterpret_cast<const sycl::half*>(W), Y,
-                        T, N, K, ldy, beta);
+    gemm_tn<sycl::half>(stream_, reinterpret_cast<const sycl::half*>(X), reinterpret_cast<const sycl::half*>(W),
+                        Y, T, N, K, ldy, beta);
 }
 
 void Gemm::native(const uint16_t* X, int ggml_type, const void* W_blocks, float* Y, int64_t T, int64_t N, int64_t K,

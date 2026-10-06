@@ -5777,7 +5777,8 @@ int main(int argc, char** argv) {
     // ---- plan v0.3 P5: the prompt's conditioning positions [0, n_prompt - 1) in batched chunks.  The token loop
     // then starts at the last prompt position, whose prediction is the first generated token.
     int64_t pos_start = 0;
-    int64_t spec_pos = 0;   // plan v0.3 P6: where the speculative loop starts (0 = not used)
+    int64_t spec_pos = -1;   // plan v0.3 P6: where the speculative loop starts (-1 = not used;
+                           // 0 is a VALID start for a native pack whose prompt is a single token)
     strata::prefill::Prefill prefill;
     double prefill_batched_ms = 0;
     std::FILE* final_r = o.dump_final_r.empty() ? nullptr : std::fopen(o.dump_final_r.c_str(), "wb");
@@ -5865,6 +5866,41 @@ int main(int argc, char** argv) {
             cudaMemcpy(d_res, host_res.data(), host_res.size() * sizeof(int32_t), cudaMemcpyHostToDevice);
             std::fprintf(stderr, "strata generate: %zu lent slots refilled in %.1f ms\n", lent.size(),
                          std::chrono::duration<double, std::milli>(Clock::now() - tr).count());
+        }
+        if (std::getenv("STRATA_STATE_HASH") != nullptr) {
+            cudaDeviceSynchronize();
+            auto fnv = [](const void* d, size_t n, uint64_t h) {
+                const uint8_t* b = (const uint8_t*) d;
+                for (size_t i = 0; i < n; ++i) { h ^= b[i]; h *= 1099511628211ull; }
+                return h;
+            };
+            std::vector<uint8_t> buf;
+            auto hdev = [&](const void* p, size_t n, uint64_t h) {
+                if (p == nullptr || n == 0) return h;
+                buf.resize(n);
+                if (cudaMemcpy(buf.data(), p, n, cudaMemcpyDeviceToHost) != cudaSuccess) return (uint64_t) 0;
+                return fnv(buf.data(), n, h);
+            };
+            const ConvStateSizes z = conv_state_sizes(g, ss);
+            uint64_t h_gdn = hdev(ss.gdn_state, z.gdn, 1469598103934665603ull);
+            uint64_t h_ple = hdev(ss.ple_hist, ss.ple_hist ? z.ple : 0, 1469598103934665603ull);
+            uint64_t h_kv = 1469598103934665603ull, h_meta = 1469598103934665603ull;
+            int64_t n_qsa_layers = 0;
+            for (int64_t l = 0; l < g.n_layers; ++l) if (strata::core::is_qsa_layer(g, l)) ++n_qsa_layers;
+            for (int64_t qi = 0; qi < n_qsa_layers; ++qi) {
+                const strata::core::QsaState& st = ss.qsa_states[qi];
+                const strata::kernels::QsaShapes qsh = strata::kernels::qsa_real_shapes();
+                const size_t pool_b = (size_t) st.max_cells * (size_t) g.n_head_kv * (size_t) qsh.page_size *
+                                      (size_t) qsh.head_dim * 2;
+                h_kv = hdev(st.k_pool, pool_b, h_kv);
+                h_kv = hdev(st.v_pool, pool_b, h_kv);
+                h_meta = hdev(st.page_table, (size_t) st.n_pages * 4, h_meta);
+                h_meta = hdev(st.idx_pooled, (size_t) st.idx_pooled_rows * (size_t) g.idx_key_dim * 4, h_meta);
+                h_meta = hdev(st.idx_dead, (size_t) g.idx_key_dim * 4, h_meta);
+            }
+            std::fprintf(stderr, "STATEHASH gdn=%016llx ple=%016llx kv=%016llx meta=%016llx\n",
+                         (unsigned long long) h_gdn, (unsigned long long) h_ple, (unsigned long long) h_kv,
+                         (unsigned long long) h_meta);
         }
         prefill_batched_ms = std::chrono::duration<double, std::milli>(Clock::now() - tp0).count();
         prefill_ms += prefill_batched_ms;
@@ -6103,7 +6139,7 @@ int main(int argc, char** argv) {
     // round emits (accepted drafts + 1) tokens.  `commit` keeps the state of the tokens that were emitted.
     const bool ended = o.stop_eos && !produced.empty() &&
                        std::find(o.eos_ids.begin(), o.eos_ids.end(), (int64_t) produced.back()) != o.eos_ids.end();
-    if (spec_pos > 0 && (int64_t) produced.size() < o.max_new && !ended) {
+    if (spec_pos >= 0 && (int64_t) produced.size() < o.max_new && !ended) {
         std::vector<int64_t> oracle;
         if (!o.spec_oracle.empty()) {
             std::ifstream in(o.spec_oracle);
@@ -6295,7 +6331,7 @@ int main(int argc, char** argv) {
             drive.d.failed = false;
             apply_pending(false);
             if (!ver.run(T, window.data(), p, &drive_pool_multi, &drive, outv.data(), err)) {
-                std::fprintf(stderr, "strata generate: %s\n", err.c_str());
+                std::fprintf(stderr, "strata generate: ver.run: %s\n", err.c_str());
                 return 1;
             }
             if (drive.d.failed) {

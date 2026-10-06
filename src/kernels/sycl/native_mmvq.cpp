@@ -254,6 +254,14 @@ void small_mmvq(const void* weights, const void* x_q8_1, float* y, int n_in, int
     if (!weights || !x_q8_1 || !y || !stream) throw std::invalid_argument("native MMVQ requires valid pointers");
     const auto* w = static_cast<const Weight*>(weights);
     const auto* x = static_cast<const Q81Block*>(x_q8_1);
+    if (g_multi_exact && ncols > 1) {
+        // the contract of native_mmvq_set_multi_exact(true): every column bitwise equal to a single-column
+        // call.  The fused NCOLS layouts reduce in a different order, so run the singles instead.
+        const size_t col_blocks = (size_t) (n_in / Q8K);
+        for (int j = 0; j < ncols; ++j)
+            small_mmvq<Weight, Qi>(w, x + j * col_blocks, y + (size_t) j * n_out, n_in, n_out, 1, stream);
+        return;
+    }
     const bool small_k = n_in / 32 < 2 * WARPS * WARP / Qi;
     switch (ncols) {
         case 1:

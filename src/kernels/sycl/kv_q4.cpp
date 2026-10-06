@@ -44,16 +44,15 @@ void fwht256_launch(const float* src, float* dst, int64_t n_rows, void* stream) 
     const int64_t num_blocks = (n_rows + rows_per_block - 1) / rows_per_block;
     const float scale = 1.0f / 16.0f;
     Q(stream).submit([&](sycl::handler& hnd) {
-        local_accessor<float, 1> redA(sycl::range<1>(32), hnd);
-        local_accessor<float, 1> redB(sycl::range<1>(32), hnd);
+        local_accessor<float, 1> redA(sycl::range<1>(128), hnd);
         hnd.parallel_for(sycl::nd_range<1>(sycl::range<1>((size_t) num_blocks * 128), sycl::range<1>(128)),
                          [=](nd_item<1> it) {
-                             const int64_t r = (int64_t) it.get_group(0) * rows_per_block +
-                                               (int64_t) (it.get_local_id(0) / 32);
+                             const int lid = (int) it.get_local_id(0);
+                             const int64_t r = (int64_t) it.get_group(0) * rows_per_block + (int64_t) (lid / 32);
                              // predicate, do not return: the butterflies below
                              // carry work-group-wide barriers
                              const bool live = r < n_rows;
-                             const int lane = (int) it.get_local_id(0) & 31;
+                             const int lane = lid & 31;
                              const float* row_src = src + (live ? r : 0) * 256;
                              float* row_dst = dst + (live ? r : 0) * 256;
                              float reg[8];
@@ -63,9 +62,11 @@ void fwht256_launch(const float* src, float* dst, int64_t n_rows, void* stream) 
                              for (int hstep = 1; hstep < 32; hstep *= 2) {
 #pragma unroll
                                  for (int j = 0; j < 8; ++j) {
-                                     redA[lane] = reg[j];
+                                     // one slot per THREAD (the work-group holds 4 rows of 32 lanes; a
+                                     // 32-slot array made the rows overwrite each other's butterflies)
+                                     redA[lid] = reg[j];
                                      it.barrier(sycl::access::fence_space::local_space);
-                                     const float val2 = redA[lane ^ hstep];
+                                     const float val2 = redA[lid ^ hstep];
                                      it.barrier(sycl::access::fence_space::local_space);
                                      const float val = reg[j];
                                      reg[j] = (lane & hstep) == 0 ? val + val2 : val2 - val;
@@ -88,7 +89,6 @@ void fwht256_launch(const float* src, float* dst, int64_t n_rows, void* stream) 
 #pragma unroll
                              for (int i = 0; i < 8; ++i)
                                  if (live) row_dst[i * 32 + lane] = reg[i];
-                             (void) redB;
                          });
     });
     check(stream, "fwht256 launch");
@@ -230,11 +230,13 @@ void kv_gather_q4_step(const uint8_t* k_q4, const uint8_t* v_q4, const int32_t* 
     const int page_size = (int) s.page_size;
     const int blocks_per_head = head_dim / QK4_0;
     const int bytes_per_head = blocks_per_head * (int) sizeof(block_q4_0);
-    const long long n_ids = (long long) step[kStepWidth];
-    const long long total_blocks = n_ids * kv_heads * blocks_per_head;
-    if (total_blocks <= 0) return;
-    Q(stream).parallel_for(sycl::range<2>((size_t) total_blocks, 32), [=](sycl::id<2> id) {
+    // the width lives in DEVICE memory (step[kStepWidth]): size the launch with
+    // max_ids and cull inside, exactly as the CUDA kernel does.  Reading it
+    // here on the host dereferences a device pointer.
+    Q(stream).parallel_for(sycl::range<2>((size_t) max_ids * kv_heads * blocks_per_head, 32), [=](sycl::id<2> id) {
+        const long long n_ids = (long long) step[kStepWidth];
         const long long blk_idx = (long long) id[0];
+        if (blk_idx >= n_ids * kv_heads * blocks_per_head) return;
         const int t = (int) id[1];
         const long long bid = blk_idx / (kv_heads * blocks_per_head);
         const int rem = (int) (blk_idx % (kv_heads * blocks_per_head));
