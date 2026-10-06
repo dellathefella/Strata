@@ -204,7 +204,7 @@ target_link_libraries(strata_engine PUBLIC strata_core strata_kernels strata_ker
 # prefill.cpp is host-shaped and compiles against the shim; gemm.cu/kernels.cu
 # are stand-ins (src/prefill/sycl_stub.cpp) until the oneMKL GEMM and batched
 # kernel ports land. The short-prompt and per-token paths never call them.
-add_library(strata_prefill STATIC src/prefill/prefill.cpp src/prefill/sycl_stub.cpp src/prefill/gemm_sycl.cpp)
+add_library(strata_prefill STATIC src/prefill/prefill.cpp src/prefill/kernels_sycl.cpp src/prefill/gemm_sycl.cpp)
 target_include_directories(strata_prefill PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/include)
 target_link_libraries(strata_prefill PUBLIC strata_engine strata_sycl_runtime)
 target_link_options(strata_prefill PUBLIC -lmkl_sycl_blas -lmkl_intel_ilp64 -lmkl_gnu_thread -lmkl_core -lgomp)
