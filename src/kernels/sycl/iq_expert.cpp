@@ -161,7 +161,11 @@ void native_expert_grouped(const NativeExpertLayout& L, const unsigned long long
                              }
                              it.barrier(sycl::access::fence_space::local_space);
                              // swiglu + q8_1 quantize, one 32-block per thread
-                             Q81Blk* hq = reinterpret_cast<Q81Blk*>(scr + 3 * (size_t) cap_e * n_ff);
+                             // PER-ENTRY offset (hq + e * hb in the CUDA kernel): without it every
+                            // work-group quantizes into the same blocks and the down projection
+                            // reads whichever group wrote last
+                            Q81Blk* hq = reinterpret_cast<Q81Blk*>(scr + 3 * (size_t) cap_e * n_ff) +
+                                         (size_t) e * d_blocks;
                              for (int b = tid; b < d_blocks; b += THREADS) {
                                  float amax = 0.0f, sum = 0.0f;
                                  int8_t qs[32];
