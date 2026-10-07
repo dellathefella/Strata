@@ -321,12 +321,13 @@ inline cudaError_t cudaFree(void* p) {
 }
 
 inline cudaError_t cudaMemcpy(void* dst, const void* src, size_t n, cudaMemcpyKind) {
-    // CUDA's synchronous memcpy is device-ordered: it cannot overlap ANY
-    // stream's work.  The default queue alone knows nothing about the other
-    // in-order queues, so drain them first (a refill must not race an
-    // undrained prefill/MTP stream that still reads the lent slots).
-    const cudaError_t drained = strata::sycl_compat::last_error() = strata::sycl_compat::sync_all_queues();
-    if (drained != cudaSuccess) return drained;
+    // The copy itself is synchronous (queued + waited on the owner's default
+    // queue).  It does NOT drain the other queues: CUDA's legacy-stream
+    // implicit sync only covers BLOCKING streams, and the engine's work
+    // streams are non-blocking - draining everything here serialized the MTP
+    // drafter's small copies behind the adaptive tier's swap traffic
+    // (3.2 s/round).  The refill protocol's own wait is cudaStreamSynchronize
+    // on stream 0, which does drain every queue.
     try {
         const int dd = strata::sycl_compat::owner_dev(dst), sd = strata::sycl_compat::owner_dev(src);
         if (dd >= 0 && sd >= 0 && dd != sd)
