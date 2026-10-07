@@ -209,4 +209,56 @@ void native_expert_grouped(const NativeExpertLayout& L, const unsigned long long
     }
 }
 
+namespace {
+// ggml-common.h kvalues_iq4nl as floats (artifact/dequant.hpp keeps the int8 form)
+constexpr float kIq4nlF[16] = {-127.0f, -104.0f, -83.0f, -65.0f, -49.0f, -35.0f, -22.0f, -10.0f,
+                               1.0f,   13.0f,   25.0f,  38.0f,  53.0f,  69.0f,  89.0f,  112.0f};
+}  // namespace
+
+// The prefill MoE's f16 staging dequantizer (dq_dispatch's Q8_0 and IQ4_NL
+// cases, one 256-value superblock per 32-thread group, gate/up interleaved
+// rows exactly as dequant_gu_kernel lays them out).
+void iq_dequant_gu_f16(int t, const void* gate, const void* up, int64_t n_ff, int64_t n_embd, uint16_t* dst,
+                       void* stream) {
+    if (n_embd % 256 != 0 || (t != 8 && t != 20)) {
+        std::fprintf(stderr, "iq_dequant_gu_f16: type %d / %lld\n", t, (long long) n_embd);
+        std::exit(1);
+    }
+    const int64_t per_row = n_embd / 256;
+    const int64_t nblk = n_ff * per_row;
+    const int blk_bytes = t == 8 ? 34 : 18;   // block_q8_0 / block_iq4_nl
+    Q(stream).submit([&](sycl::handler& hnd) {
+        hnd.parallel_for(sycl::nd_range<1>(sycl::range<1>((size_t) nblk * 2 * 32), sycl::range<1>(32)),
+                         [=](nd_item<1> it) {
+                             const int64_t blk = (int64_t) it.get_group(0);
+                             const int parity = (int) (blk / nblk);          // dim3(nblk, 2), x fastest
+                             const int64_t i = blk % nblk;
+                             const int64_t r = i / per_row, c = i % per_row;
+                             const int tid = (int) it.get_local_id(0);
+                             const uint8_t* base = (const uint8_t*) (parity ? up : gate);
+                             uint16_t* y = dst + ((2 * r + parity) * per_row + c) * 256;
+                             const int ib = tid % 8, il = tid / 8;
+                             const uint8_t* b = base + (i * 8 + ib) * (size_t) blk_bytes;
+                             const float d = wscale(b);
+                             if (t == 8) {
+                                 const int8_t* qs = (const int8_t*) (b + 2);
+                                 uint16_t* yy = y + 32 * ib + 8 * il;
+                                 for (int j = 0; j < 8; ++j) yy[j] = f16_from_f32((float) qs[8 * il + j] * d);
+                             } else {
+                                 const uint8_t* q4 = b + 2 + 4 * il;
+                                 uint16_t* yy = y + 32 * ib + 4 * il;
+                                 for (int j = 0; j < 4; ++j) {
+                                     yy[j] = f16_from_f32(d * kIq4nlF[q4[j] & 0xf]);
+                                     yy[j + 16] = f16_from_f32(d * kIq4nlF[q4[j] >> 4]);
+                                 }
+                             }
+                         });
+    });
+    const cudaError_t err = cudaGetLastError();
+    if (err != cudaSuccess) {
+        std::fprintf(stderr, "iq_dequant_gu_f16: %s\n", cudaGetErrorString(err));
+        std::exit(1);
+    }
+}
+
 }  // namespace strata::kernels

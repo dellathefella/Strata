@@ -56,9 +56,6 @@ void moe_group_resident(const int32_t*, int, int, const uint8_t*, int64_t, unsig
 // ---- native (GGUF-block) grouped experts + iq dequant/embed ----
 void iq_set_old_kernels(bool) {}
 bool iq_old_kernels() { return false; }
-void iq_dequant_gu_f16(int, const void*, const void*, int64_t, int64_t, uint16_t*, void*) {
-    unported("iq_dequant_gu_f16");
-}
 
 // ---- control vectors ----
 void cvec_set_enabled(bool) {}
