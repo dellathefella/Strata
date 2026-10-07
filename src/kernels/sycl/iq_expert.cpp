@@ -76,7 +76,11 @@ inline float q80_row_dot(const uint8_t* wrow, const Q81Blk* x, int n_blocks, int
         if (lid < o) red[lid] += red[lid + o];
         it.barrier(sycl::access::fence_space::local_space);
     }
-    return red[0];
+    // EVERY thread must finish reading the result before the next call's
+    // red[lid] = acc overwrites it (consecutive dots share the array)
+    const float r = red[0];
+    it.barrier(sycl::access::fence_space::local_space);
+    return r;
 }
 
 }  // namespace
