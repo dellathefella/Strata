@@ -185,18 +185,21 @@ void kv_stream_resolve(const KvStreamMap& m, const QsaAttnPools& slots, const Kv
                 }
                 if (lane == 31) warp_sums[w] = x;
                 it.barrier(sycl::access::fence_space::local_space);
-                if (w == 0) {
-                    int t2 = warp_sums[tx];
+                // the warp-sums sweep: EVERY thread reaches every barrier (a
+                // barrier inside `if (w == 0)` is non-uniform and undefined);
+                // only warp 0's lanes carry meaningful values
+                {
+                    int t2 = (tx < 32) ? warp_sums[tx] : 0;
                     scan[tx] = t2;
                     it.barrier(sycl::access::fence_space::local_space);
                     for (int o = 1; o < 32; o <<= 1) {
-                        const int y = lane >= o ? scan[tx - o] : 0;
+                        const int y = (w == 0 && lane >= o) ? scan[tx - o] : 0;
                         it.barrier(sycl::access::fence_space::local_space);
-                        if (lane >= o) t2 += y;
+                        t2 += y;
                         scan[tx] = t2;
                         it.barrier(sycl::access::fence_space::local_space);
                     }
-                    warp_sums[tx] = t2;
+                    if (w == 0) warp_sums[tx] = t2;
                 }
                 it.barrier(sycl::access::fence_space::local_space);
                 const int total = warp_sums[31];
