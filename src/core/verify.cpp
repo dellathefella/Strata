@@ -410,9 +410,34 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
     auto stamp = [&](int64_t l, int i, int grp) {
         if (prof_on_ && grp == 0) gpu_stamp(prof_, (int) (l * kProfPer + i), cs);
         static const bool win_sync = std::getenv("STRATA_WIN_SYNC") != nullptr;
-        if (win_sync && grp == 0) {
+        static const bool win_hash = std::getenv("STRATA_WIN_HASH") != nullptr;
+        if ((win_sync || win_hash) && grp == 0) {
             const cudaError_t e = cudaStreamSynchronize(cs);
-            std::fprintf(stderr, "[dbg] win sync l=%lld i=%d -> %s\n", (long long) l, i, cudaGetErrorString(e));
+            if (win_sync)
+                std::fprintf(stderr, "[dbg] win sync l=%lld i=%d -> %s\n", (long long) l, i, cudaGetErrorString(e));
+            if (win_hash) {
+                static std::vector<float> hb;
+                auto fh = [&](float* dev, size_t n, uint64_t h) {
+                    hb.resize(n);
+                    cudaMemcpy(hb.data(), dev, n * 4, cudaMemcpyDeviceToHost);
+                    const uint8_t* b = (const uint8_t*) hb.data();
+                    for (size_t j = 0; j < n * 4; ++j) { h ^= b[j]; h *= 1099511628211ull; }
+                    return h;
+                };
+                uint64_t h = 1469598103934665603ull;
+                h = fh(R_, (size_t) T * HC * N, h);
+                h = fh(bo_, (size_t) T * N, h);
+                h = fh(inj_, (size_t) T * HC, h);
+                h = fh(inj2_, (size_t) T * HC, h);
+                h = fh(mixed_, (size_t) T * N, h);
+                std::fprintf(stderr, "[whash] l=%lld i=%d %016llx | R=%016llx bo=%016llx ij=%016llx ij2=%016llx mx=%016llx\n",
+                             (long long) l, i, (unsigned long long) h,
+                             (unsigned long long) fh(R_, (size_t) T * HC * N, 1469598103934665603ull),
+                             (unsigned long long) fh(bo_, (size_t) T * N, 1469598103934665603ull),
+                             (unsigned long long) fh(inj_, (size_t) T * HC, 1469598103934665603ull),
+                             (unsigned long long) fh(inj2_, (size_t) T * HC, 1469598103934665603ull),
+                             (unsigned long long) fh(mixed_, (size_t) T * N, 1469598103934665603ull));
+            }
         }
     };
     const int tb_[2] = {0, (T + 1) / 2}, te_[2] = {G == 2 ? (T + 1) / 2 : T, T};

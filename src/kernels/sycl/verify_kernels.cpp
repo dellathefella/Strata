@@ -272,6 +272,10 @@ void gdn_step_norm_multi(float* state, const float* h, int conv_channels, const 
                                           sycl::rsqrt((float) S);
                                      sq_part = oc * oc;
                                  }
+                                 // every row group must finish reading red[] for oc before xor_reduce32
+                                 // reuses the same array (CUDA's warp_sum used shuffles and touched no
+                                 // shared memory; the local-memory port does) - uniform, before the continue
+                                 it.barrier(sycl::access::fence_space::local_space);
                                  if (t < t_out_begin) continue;  // uniform: replayed token, no output
                                  sq_part = xor_reduce32(sq_part, tid, red, it);
                                  if ((tid & 31) == 0) wsum[tid >> 5] = sq_part;

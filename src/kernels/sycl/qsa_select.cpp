@@ -102,6 +102,14 @@ void qsa_block_topk(const float* scores, const int32_t* steps, int64_t nq, int64
     (void) s;
     (void) active_blocks;
     if (nq <= 0) return;
+    if (std::getenv("STRATA_TOPK_DBG") != nullptr) {
+        int32_t hs[4] = {};
+        cudaMemcpy(hs, steps, sizeof hs, cudaMemcpyDeviceToHost);
+        float s0 = 0.0f;
+        cudaMemcpy(&s0, scores, 4, cudaMemcpyDeviceToHost);
+        std::fprintf(stderr, "[topk] qi0 step={%d,%d,%d,%d} sc[0]=%f nq=%lld cap=%lld max_blocks=%lld\n", hs[0],
+                     hs[1], hs[2], hs[3], s0, (long long) nq, (long long) cap, (long long) max_blocks);
+    }
     Q(stream).submit([&](sycl::handler& hnd) {
         local_accessor<int, 1> hist(sycl::range<1>(256), hnd);
         local_accessor<int, 1> s_a(sycl::range<1>(TOPK_T), hnd);

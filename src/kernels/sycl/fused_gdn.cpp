@@ -185,6 +185,8 @@ void fused_gdn_step_norm(float* state, const float* q, const float* k, const flo
                                       sycl::rsqrt((float) S);
                                  sq_part = oc * oc;
                              }
+                             // red[] must be fully consumed by the oc reads before the reduce reuses it
+                             it.barrier(sycl::access::fence_space::local_space);
                              sq_part = xor_reduce32(sq_part, tid, red, it);
                              if ((tid & 31) == 0) wsum[tid >> 5] = sq_part;
                              it.barrier(sycl::access::fence_space::local_space);

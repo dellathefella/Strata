@@ -309,11 +309,14 @@ void qsa_index_step(const float* pooled, const float* q_idx, const float* bias, 
 
 void qsa_index(const float* pooled, int64_t n_bid, const float* q_idx, const float* bias, const QsaShapes& s,
                int64_t n_kv, float* cell_scores, void* stream) {
-    int32_t h[kStepCount] = {0, 0, 0, 0};
-    h[kStepNBid] = (int32_t) n_bid;
-    h[kStepNKv] = (int32_t) n_kv;
-    step_upload_raw(h);
-    qsa_index_step(pooled, q_idx, bias, s, step_scratch(), n_bid + 1, cell_scores, stream);
+    validate(s, "qsa_index");
+    if (n_bid < 0 || n_kv <= 0) fail("qsa_index: n_bid < 0 or n_kv <= 0");
+    if ((n_kv / s.idx_block) != n_bid) {
+        std::fprintf(stderr, "qsa: qsa_index: n_bid %lld is not n_kv %lld / r %lld\n", (long long) n_bid,
+                     (long long) n_kv, (long long) s.idx_block);
+        std::exit(1);
+    }
+    qsa_index_step(pooled, q_idx, bias, s, step_upload(n_kv - 1, n_kv, s), n_bid + 1, cell_scores, stream);
 }
 
 void topk_512_step(const float* cell_scores, const QsaShapes& s, int64_t cap, const int32_t* step, int32_t* ids,
@@ -416,11 +419,16 @@ void topk_512_step(const float* cell_scores, const QsaShapes& s, int64_t cap, co
 }
 
 void topk_512(const float* cell_scores, int64_t n_kv, const QsaShapes& s, int64_t cap, int32_t* ids, void* stream) {
-    int32_t h[kStepCount] = {0, 0, 0, 0};
-    h[kStepNKv] = (int32_t) n_kv;
-    h[kStepWidth] = (int32_t) cap;
-    step_upload_raw(h);
-    topk_512_step(cell_scores, s, cap, step_scratch(), ids, stream);
+    validate(s, "topk_512");
+    if (n_kv <= 0) return;
+    if (n_kv > kTopkMaxCells) {
+        std::fprintf(stderr, "qsa: topk_512: n_kv %lld > kTopkMaxCells %lld (one block; phase 3 replaces this)\n",
+                     (long long) n_kv, (long long) kTopkMaxCells);
+        std::exit(1);
+    }
+    // the width comes from qsa_step_fill (qsa_selection_width(n_kv)), NOT from cap:
+    // cap is only the ids buffer's capacity
+    topk_512_step(cell_scores, s, cap, step_upload(n_kv - 1, n_kv, s), ids, stream);
 }
 
 void kv_gather_step(const uint16_t* k_pool, const uint16_t* v_pool, const int32_t* page_table, const int32_t* ids,
@@ -531,6 +539,14 @@ void qsa_attend_step(const float* q, const uint16_t* k_scratch, const uint16_t* 
 
 void qsa_attend(const float* q, const uint16_t* k_scratch, const uint16_t* v_scratch, int64_t n_ids,
                 const QsaShapes& s, float* attn, float* weights, void* stream) {
+    validate(s, "qsa_attend");
+    if (n_ids < 0) fail("qsa_attend: n_ids < 0");
+    if (n_ids == 0) {
+        // the empty selection goes through the kernel's own zero path; max_ids stays positive
+        qsa_attend_step(q, k_scratch, v_scratch, step_upload_width(0, s),
+                        qsa_selection_width(kTopkMaxCells, s), s, attn, weights, stream);
+        return;
+    }
     qsa_attend_step(q, k_scratch, v_scratch, step_upload_width(n_ids, s), n_ids, s, attn, weights, stream);
 }
 
