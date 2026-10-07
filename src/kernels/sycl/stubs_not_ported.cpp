@@ -116,9 +116,12 @@ bool cvec_replicate(std::string& err) {
 }  // namespace strata::kernels
 
 namespace strata::kernels {
-void qsa_prompt_attn_batch(const float*, const QsaAttnPools&, const int32_t*, const int32_t*, int64_t,
+bool qsa_prompt_attn_batch(const float*, const QsaAttnPools&, const int32_t*, const int32_t*, int64_t,
                            const QsaShapes&, float*, int64_t, void*) {
-    unported("qsa_prompt_attn_batch");
+    // false = "this device cannot": prefill falls back to chunked
+    // qsa_decode_attn_batch (ported, parity-clean).  A native flash port can
+    // replace this later for prompt speed.
+    return false;
 }
 }  // namespace strata::kernels
 
