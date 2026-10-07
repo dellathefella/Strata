@@ -160,6 +160,156 @@ void down_launch(const uint8_t* blob_base, const int32_t* slot_index, const int3
     });
 }
 
+// ---- the MTP draft layer's grouped MoE (moe_group_resident + moe_grouped_s2).
+// The slow (non-transposed) grouped kernels are enough here: a draft round
+// groups at most T*K entries and this path is not the hot loop.
+constexpr int GMAX = 8;         // entries per group (CUDA: GMAX)
+constexpr int GU_ROWS = 32;     // gate/up rows per block
+constexpr int D_ROWS = 64;      // down rows per block
+
+// staged-word chunk dot: cb = the row's 8 code bytes of one 32-element chunk,
+// xw = the entry's eight staged activation words, dw/dx the scales
+inline float chunk_dot_words(const uint8_t* cb8, const int* xw, float dw, float dx) {
+    int s = 0, hx = 0;
+    const int ones = 0x01010101;
+#pragma unroll
+    for (int j = 0; j < 8; ++j) {
+        const unsigned cbyte = cb8[j];
+        const int cw = (int) ((cbyte & 3u) | (((cbyte >> 2) & 3u) << 8) | (((cbyte >> 4) & 3u) << 16) |
+                              (((cbyte >> 6) & 3u) << 24));
+        s = STRATA_DP4A(cw, xw[j], s);
+        hx = STRATA_DP4A(ones, xw[j], hx);
+    }
+    return dw * dx * (float) (s - hx);
+}
+
+void gu_grouped_launch(const unsigned long long* grp_ptr, const int32_t* grp_start, const int32_t* n_groups,
+                       const int32_t* ent_tok, const uint8_t* x_q8_0, const float* x_scales, float* gate_up,
+                       int cap_entries, int cap_groups, void* stream) {
+    const size_t row_blocks = (size_t) (2 * FF) / GU_ROWS;   // 40
+    Q(stream).submit([&](sycl::handler& hnd) {
+        local_accessor<int, 1> xs_q(sycl::range<1>(GMAX * (H / 4)), hnd);
+        local_accessor<float, 1> xs_d(sycl::range<1>(GMAX * (H / 32)), hnd);
+        local_accessor<float, 1> red(sycl::range<1>(THREADS), hnd);
+        hnd.parallel_for(sycl::nd_range<1>(sycl::range<1>(row_blocks * (size_t) cap_groups * THREADS),
+                                           sycl::range<1>(THREADS)),
+                         [=](nd_item<1> it) {
+                             const size_t blk = it.get_group(0);
+                             const int rowblk = (int) (blk % row_blocks);
+                             const int g = (int) (blk / row_blocks);
+                             const int t = (int) it.get_local_id(0);
+                             const int lane = t & 31, warp = t >> 5;
+                             const int ng = *n_groups;
+                             const bool live = g < ng;
+                             const int e0 = live ? grp_start[g] : 0;
+                             int ne = live ? grp_start[g + 1] - e0 : 0;
+                             if (ne > GMAX) ne = GMAX;
+                             for (int i = t; i < ne * (H / 32); i += THREADS) {
+                                 const int k = i / (H / 32), c = i - k * (H / 32);
+                                 const uint8_t* xb =
+                                     x_q8_0 + (size_t) ent_tok[e0 + k] * (size_t) (H / 32) * 34 + (size_t) c * 34;
+                                 xs_d[k * (H / 32) + c] =
+                                     x_scales ? x_scales[(size_t) ent_tok[e0 + k] * (H / 32) + c] : f16_at(xb);
+                                 const uint8_t* q = xb + 2;
+#pragma unroll
+                                 for (int w = 0; w < 8; ++w) {
+                                     int v;
+                                     memcpy(&v, q + 4 * w, 4);
+                                     xs_q[k * (H / 4) + c * 8 + w] = v;
+                                 }
+                             }
+                             it.barrier(sycl::access::fence_space::local_space);
+                             if (!live) return;
+                             const uint8_t* blob = (const uint8_t*) (uintptr_t) grp_ptr[g];
+                             const int row0 = rowblk * GU_ROWS;
+                             for (int rr = warp; rr < GU_ROWS; rr += WARPS) {
+                                 const int i = row0 + rr;
+                                 const uint8_t* codes = blob + (size_t) i * ROW_GU;
+                                 const uint8_t* scales = blob + O_GU_SCALES + (size_t) i * SC_GU * 2;
+                                 for (int k = 0; k < ne; ++k) {
+                                     float acc = 0.0f;
+#pragma unroll
+                                     for (int q = 0; q < H / 32 / 32; ++q) {
+                                         const int c = lane + 32 * q;
+                                         if (c >= H / 32) break;
+                                         acc += chunk_dot_words(codes + (size_t) c * 8, &xs_q[k * (H / 4) + c * 8],
+                                                                f16_at(scales + (size_t) (c >> 1) * 2),
+                                                                xs_d[k * (H / 32) + c]);
+                                     }
+                                     const float sum = chunk_sum(acc, t, red, it);
+                                     if (lane == 0) {
+                                         const int e = e0 + k, r = i >> 1;
+                                         const size_t base =
+                                             (i & 1) ? ((size_t) cap_entries * FF + (size_t) e * FF)
+                                                     : ((size_t) e * FF);
+                                         gate_up[base + (size_t) r] = sum;
+                                     }
+                                 }
+                             }
+                         });
+    });
+    check(stream, "moe_grouped_s2/gu");
+}
+
+void down_grouped_launch(const unsigned long long* grp_ptr, const int32_t* grp_start, const int32_t* n_groups,
+                         const int32_t* ent_dst, const uint8_t* h_q8_0, const float* h_scales, float* out,
+                         int cap_groups, void* stream) {
+    const size_t row_blocks = (size_t) H / D_ROWS;   // 40
+    Q(stream).submit([&](sycl::handler& hnd) {
+        local_accessor<int, 1> hs_q(sycl::range<1>(GMAX * (FF / 4)), hnd);
+        local_accessor<float, 1> hs_d(sycl::range<1>(GMAX * (FF / 32)), hnd);
+        local_accessor<float, 1> red(sycl::range<1>(THREADS), hnd);
+        hnd.parallel_for(sycl::nd_range<1>(sycl::range<1>(row_blocks * (size_t) cap_groups * THREADS),
+                                           sycl::range<1>(THREADS)),
+                         [=](nd_item<1> it) {
+                             const size_t blk = it.get_group(0);
+                             const int rowblk = (int) (blk % row_blocks);
+                             const int g = (int) (blk / row_blocks);
+                             const int t = (int) it.get_local_id(0);
+                             const int lane = t & 31, warp = t >> 5;
+                             const bool live = g < *n_groups;
+                             const int e0 = live ? grp_start[g] : 0;
+                             int ne = live ? grp_start[g + 1] - e0 : 0;
+                             if (ne > GMAX) ne = GMAX;
+                             for (int i = t; i < ne * (FF / 32); i += THREADS) {
+                                 const int k = i / (FF / 32), c = i - k * (FF / 32);
+                                 const uint8_t* xb = h_q8_0 + (size_t) (e0 + k) * (size_t) (FF / 32) * 34 +
+                                                     (size_t) c * 34;
+                                 hs_d[k * (FF / 32) + c] = h_scales ? h_scales[(size_t) (e0 + k) * (FF / 32) + c]
+                                                                    : f16_at(xb);
+                                 const uint8_t* q = xb + 2;
+#pragma unroll
+                                 for (int w = 0; w < 8; ++w) {
+                                     int v;
+                                     memcpy(&v, q + 4 * w, 4);
+                                     hs_q[k * (FF / 4) + c * 8 + w] = v;
+                                 }
+                             }
+                             it.barrier(sycl::access::fence_space::local_space);
+                             if (!live) return;
+                             const uint8_t* blob = (const uint8_t*) (uintptr_t) grp_ptr[g];
+                             const int row0 = rowblk * D_ROWS;
+                             for (int rr = warp; rr < D_ROWS; rr += WARPS) {
+                                 const int r = row0 + rr;
+                                 const uint8_t* codes = blob + O_D_CODES + (size_t) r * ROW_D;
+                                 const uint8_t* scales = blob + O_D_SCALES + (size_t) r * SC_D * 2;
+                                 const int c = lane;
+                                 const bool has = c < FF / 32;
+                                 for (int k = 0; k < ne; ++k) {
+                                     float acc = 0.0f;
+                                     if (has)
+                                         acc += chunk_dot_words(codes + (size_t) c * 8, &hs_q[k * (FF / 4) + c * 8],
+                                                                f16_at(scales + (size_t) (c >> 1) * 2),
+                                                                hs_d[k * (FF / 32) + c]);
+                                     const float sum = chunk_sum(acc, t, red, it);
+                                     if (lane == 0) out[(size_t) ent_dst[e0 + k] * H + r] = sum;
+                                 }
+                             }
+                         });
+    });
+    check(stream, "moe_grouped_s2/down");
+}
+
 void hit_grouped(const uint8_t* blob_base, const int32_t* slot_index, const int32_t* dst_index, int64_t n_hits,
                  int64_t blob_bytes, const uint8_t* x_q8_0, void* scratch, float* out, void* stream,
                  const float* x_scales, const int32_t* d_count, int tok_div) {
@@ -301,6 +451,72 @@ void moe_hit_grouped_s2_multi(const uint8_t* blob_base, const int32_t* slot_inde
     if (cap <= 0) return;
     hit_grouped(blob_base, slot_index, dst_index, cap, blob_bytes, x_q8_0, scratch, out, stream, x_scales, d_count,
                 k_per_token);
+}
+
+void moe_group_resident(const int32_t* ids, int n, int k_per_tok, const uint8_t* base, int64_t blob,
+                        unsigned long long* grp_ptr, int32_t* grp_start, int32_t* counts, int32_t* ent_dst,
+                        int32_t* ent_tok, void* stream) {
+    if (n < 1 || n > 128) {
+        std::fprintf(stderr, "moe_group_resident: n must be 1..128\n");
+        std::exit(1);
+    }
+    // one task: the CUDA kernel is a single 128-thread block doing three tiny
+    // scans; sequential is the same work at this size and barrier-free
+    Q(stream).single_task([=] {
+        int first_of[128], rank_of[128], size_of[128], gidx[128], gstart[129];
+        for (int i = 0; i < n; ++i) {
+            const int e = ids[i];
+            int first = i, rank = 0, size = 0;
+            for (int j = 0; j < i; ++j)
+                if (ids[j] == e) { if (first == i) first = j; ++rank; }
+            if (first == i)
+                for (int j = i; j < n; ++j) size += ids[j] == e;
+            first_of[i] = first; rank_of[i] = rank; size_of[i] = (first == i) ? size : 0;
+        }
+        int gi = 0, acc = 0;
+        for (int j = 0; j < n; ++j)
+            if (first_of[j] == j) {
+                gidx[j] = gi;
+                gstart[gi] = acc;
+                grp_ptr[gi] = (unsigned long long) (base + (size_t) ids[j] * (size_t) blob);
+                grp_start[gi] = acc;
+                acc += size_of[j];
+                ++gi;
+            }
+        grp_start[gi] = acc;
+        counts[0] = gi;
+        counts[1] = acc;
+        for (int i = 0; i < n; ++i) {
+            const int at = gstart[gidx[first_of[i]]] + rank_of[i];
+            ent_dst[at] = i;
+            ent_tok[at] = i / k_per_tok;
+        }
+    });
+    check(stream, "moe_group_resident");
+}
+
+void moe_grouped_s2(const unsigned long long* grp_ptr, const int32_t* grp_start, const int32_t* n_groups,
+                    const int32_t* ent_dst, const int32_t* ent_tok, int64_t cap_groups, int64_t cap_entries,
+                    const uint8_t* x_q8_0, const float* x_scales, void* scratch, float* out, void* stream) {
+    if (cap_groups <= 0 || cap_entries <= 0) return;
+    const uint64_t gu_bytes = ((uint64_t) cap_entries * (uint64_t) (2 * FF) * 4 + 15) & ~15ull;
+    const uint64_t q8_bytes = ((uint64_t) cap_entries * (uint64_t) (FF / 32) * 34 + 15) & ~15ull;
+    float* gate_up = (float*) scratch;
+    uint8_t* h_q8_0 = (uint8_t*) scratch + gu_bytes;
+    float* h_scales = (float*) ((uint8_t*) scratch + gu_bytes + q8_bytes);
+    gu_grouped_launch(grp_ptr, grp_start, n_groups, ent_tok, x_q8_0, x_scales, gate_up, (int) cap_entries,
+                      (int) cap_groups, stream);
+    const long long pairs = cap_entries * (long long) FF;
+    Q(stream).parallel_for((size_t) pairs, [=](size_t i) {
+        const float gv = gate_up[i];
+        const float u = gate_up[pairs + i];
+        gate_up[i] = (gv / (1.0f + sycl::exp(-gv))) * u;
+    });
+    check(stream, "moe_grouped_s2/swiglu");
+    if (x_scales != nullptr) quantize_q8_0_scaled(gate_up, h_q8_0, h_scales, cap_entries * (int64_t) FF, stream);
+    else quantize_q8_0(gate_up, h_q8_0, cap_entries * (int64_t) FF, stream);
+    down_grouped_launch(grp_ptr, grp_start, n_groups, ent_dst, h_q8_0, x_scales != nullptr ? h_scales : nullptr, out,
+                        (int) cap_groups, stream);
 }
 
 // The SYCL port has ONE grouped implementation (the CUDA file's "new" kernels);

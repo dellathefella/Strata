@@ -44,14 +44,6 @@ void shared_expert(const uint8_t*, const uint8_t*, const uint16_t*, const SForm&
 void moe_combine(const float*, const float*, const float*, float*, int64_t, int64_t, void*) {
     unported("moe_combine");
 }
-void moe_grouped_s2(const unsigned long long*, const int32_t*, const int32_t*, const int32_t*, const int32_t*, int64_t,
-                    int64_t, const uint8_t*, const float*, void*, float*, void*) {
-    unported("moe_grouped_s2");
-}
-void moe_group_resident(const int32_t*, int, int, const uint8_t*, int64_t, unsigned long long*, int32_t*, int32_t*,
-                        int32_t*, int32_t*, void*) {
-    unported("moe_group_resident");
-}
 
 // ---- native (GGUF-block) grouped experts + iq dequant/embed ----
 void iq_set_old_kernels(bool) {}
