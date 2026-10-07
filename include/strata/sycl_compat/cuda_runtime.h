@@ -65,14 +65,49 @@ namespace strata::sycl_compat {
 
 namespace ex = sycl::ext::oneapi::experimental;
 
+// ---- multi-device: a thread-local current device (cudaSetDevice), one
+// default in-order queue per device, and an owner map so copies can pick the
+// right context (Arc has no peer access: cross-device goes through the host)
+inline std::vector<sycl::device>& device_list() {
+    static std::vector<sycl::device> devs = sycl::device::get_devices(sycl::info::device_type::gpu);
+    return devs;
+}
+inline int& current_device_ref() {
+    static thread_local int d = 0;
+    return d;
+}
+inline int current_device_clamped() {
+    const int n = (int) device_list().size();
+    int d = current_device_ref();
+    if (d < 0 || d >= n) d = 0;
+    return d;
+}
+inline sycl::device& current_device() { return device_list()[(size_t) current_device_clamped()]; }
+inline sycl::queue& default_queue_on(int dev) {
+    static std::vector<std::unique_ptr<sycl::queue>> qs;
+    static std::mutex m;
+    std::lock_guard<std::mutex> lk(m);
+    auto& l = device_list();
+    const int d = (dev >= 0 && dev < (int) l.size()) ? dev : 0;
+    if ((int) qs.size() <= d) qs.resize((size_t) d + 1);
+    if (!qs[(size_t) d])
+        qs[(size_t) d] = std::make_unique<sycl::queue>(
+            l[(size_t) d], sycl::property_list{sycl::property::queue::in_order{},
+                                               sycl::property::queue::enable_profiling{}});
+    return *qs[(size_t) d];
+}
+inline sycl::queue& default_queue() { return default_queue_on(current_device_clamped()); }
+
 struct stream_wrap {
     sycl::queue q;
     // non-null between cudaStreamBeginCapture and cudaStreamEndCapture
     std::unique_ptr<ex::command_graph<ex::graph_state::modifiable>> rec;
     bool capturing = false;
+    int dev = 0;   // the device this stream's queue belongs to
     explicit stream_wrap(const sycl::device& d)
         : q(d, sycl::property_list{sycl::property::queue::in_order{},
-                                   sycl::property::queue::enable_profiling{}}) {}
+                                   sycl::property::queue::enable_profiling{}}),
+          dev(current_device_clamped()) {}
 };
 
 struct graph_wrap {
@@ -86,17 +121,23 @@ struct graphexec_wrap {
 
 struct event_wrap {
     sycl::event e;
+    int dev = -1;   // the device the last record ran on (-1 = never recorded)
 };
 
-inline sycl::queue& default_queue() {
-    static sycl::queue q(sycl::gpu_selector_v,
-                         sycl::property_list{sycl::property::queue::in_order{},
-                                             sycl::property::queue::enable_profiling{}});
-    return q;
-}
+
 
 inline sycl::queue& q_for(void* stream) {
     return stream ? static_cast<stream_wrap*>(stream)->q : default_queue();
+}
+inline int dev_of_stream(void* stream) {
+    return stream ? static_cast<stream_wrap*>(stream)->dev : current_device_clamped();
+}
+// Arc cards have no peer access: a device-to-device copy across contexts goes
+// through the host (the split's hand-off is a few hundred KB per window).
+inline void bounce_copy(void* dst, int dst_dev, const void* src, int src_dev, size_t n) {
+    std::vector<char> tmp(n);
+    default_queue_on(src_dev).memcpy(tmp.data(), const_cast<void*>(src), n).wait_and_throw();
+    default_queue_on(dst_dev).memcpy(dst, tmp.data(), n).wait_and_throw();
 }
 
 // Registry of every created stream, so a legacy-default-stream sync can stand
@@ -115,11 +156,13 @@ inline std::vector<stream_wrap*>& stream_registry() {
 }
 inline cudaError_t sync_all_queues() {
     cudaError_t first = cudaSuccess;
-    try {
-        default_queue().wait_and_throw();
-    } catch (const sycl::exception& ex) {
-        std::fprintf(stderr, "sycl_compat sync_all: %s\n", ex.what());
-        first = cudaErrorUnknown;
+    for (int di = 0; di < (int) device_list().size(); ++di) {
+        try {
+            default_queue_on(di).wait_and_throw();
+        } catch (const sycl::exception& ex) {
+            std::fprintf(stderr, "sycl_compat sync_all: %s\n", ex.what());
+            first = cudaErrorUnknown;
+        }
     }
     std::vector<stream_wrap*> copy;
     {
@@ -185,23 +228,59 @@ inline void dump_allocations() {
     std::fprintf(stderr, "[alloc-map] %zu entries\n", m.size());
     for (auto& kv : m) std::fprintf(stderr, "[alloc-map] %p + %zu\n", kv.first, kv.second);
 }
+inline std::unordered_map<void*, int>& dev_map() {
+    static std::unordered_map<void*, int> m;
+    return m;
+}
+inline std::atomic<size_t>& allocated_on(int dev) {
+    static std::vector<std::unique_ptr<std::atomic<size_t>>> v;
+    static std::mutex m;
+    std::lock_guard<std::mutex> lk(m);
+    if ((int) v.size() <= dev) v.resize((size_t) dev + 1);
+    if (!v[(size_t) dev]) v[(size_t) dev] = std::make_unique<std::atomic<size_t>>(0);
+    return *v[(size_t) dev];
+}
 inline void remember_alloc(void* p, size_t n) {
     {
         std::lock_guard<std::mutex> g(sizes_mutex());
         sizes_map()[p] = n;
+        dev_map()[p] = current_device_clamped();
+    }
+    allocated().fetch_add(n);
+    allocated_on(current_device_clamped()).fetch_add(n);
+}
+inline void remember_host(void* p, size_t n) {
+    {
+        std::lock_guard<std::mutex> g(sizes_mutex());
+        sizes_map()[p] = n;
+        dev_map()[p] = -2;   // USM host: reachable from every device
     }
     allocated().fetch_add(n);
 }
+// the device an allocation belongs to (-2: USM host, -1: untracked host)
+inline int owner_dev(const void* p) {
+    if (!p) return -1;
+    std::lock_guard<std::mutex> g(sizes_mutex());
+    for (const auto& kv : sizes_map()) {
+        const uintptr_t b = (uintptr_t) kv.first;
+        if ((uintptr_t) p >= b && (uintptr_t) p < b + kv.second) return dev_map()[kv.first];
+    }
+    return -1;
+}
 inline void forget_alloc(void* p) {
     size_t n = 0;
+    int dev = -1;
     {
         std::lock_guard<std::mutex> g(sizes_mutex());
         auto it = sizes_map().find(p);
         if (it != sizes_map().end()) {
             n = it->second;
+            auto dit = dev_map().find(p);
+            if (dit != dev_map().end()) { dev = dit->second; dev_map().erase(dit); }
             sizes_map().erase(it);
         }
     }
+    if (n && dev >= 0) allocated_on(dev).fetch_sub(n);
     allocated().fetch_sub(n);
 }
 
@@ -249,9 +328,15 @@ inline cudaError_t cudaMemcpy(void* dst, const void* src, size_t n, cudaMemcpyKi
     const cudaError_t drained = strata::sycl_compat::last_error() = strata::sycl_compat::sync_all_queues();
     if (drained != cudaSuccess) return drained;
     try {
-        strata::sycl_compat::default_queue()
-            .memcpy(dst, const_cast<void*>(src), n)
-            .wait_and_throw();
+        const int dd = strata::sycl_compat::owner_dev(dst), sd = strata::sycl_compat::owner_dev(src);
+        if (dd >= 0 && sd >= 0 && dd != sd)
+            strata::sycl_compat::bounce_copy(dst, dd, src, sd, n);
+        else {
+            const int dev = dd >= 0 ? dd : (sd >= 0 ? sd : strata::sycl_compat::current_device_clamped());
+            strata::sycl_compat::default_queue_on(dev)
+                .memcpy(dst, const_cast<void*>(src), n)
+                .wait_and_throw();
+        }
     } catch (const sycl::exception& ex) {
         std::fprintf(stderr, "sycl_compat cudaMemcpy: %s\n", ex.what());
         return strata::sycl_compat::last_error() = cudaErrorUnknown;
@@ -262,7 +347,21 @@ inline cudaError_t cudaMemcpy(void* dst, const void* src, size_t n, cudaMemcpyKi
 inline cudaError_t cudaMemcpyAsync(void* dst, const void* src, size_t n,
                                    cudaMemcpyKind, cudaStream_t s) {
     try {
-        strata::sycl_compat::q_for(s).memcpy(dst, const_cast<void*>(src), n);
+        const int sd = strata::sycl_compat::dev_of_stream(s);
+        const int dd = strata::sycl_compat::owner_dev(dst), ssd = strata::sycl_compat::owner_dev(src);
+        if (dd >= 0 && ssd >= 0 && dd != ssd) {
+            // device-to-device across cards: synchronous host bounce
+            strata::sycl_compat::bounce_copy(dst, dd, src, ssd, n);
+        } else if ((dd >= 0 && dd != sd) || (ssd >= 0 && ssd != sd)) {
+            // a device pointer that belongs to another card than the stream:
+            // drain the stream, then copy on the pointer's own default queue
+            strata::sycl_compat::q_for(s).wait_and_throw();
+            const int dev = dd >= 0 ? dd : ssd;
+            strata::sycl_compat::default_queue_on(dev)
+                .memcpy(dst, const_cast<void*>(src), n)
+                .wait_and_throw();
+        } else
+            strata::sycl_compat::q_for(s).memcpy(dst, const_cast<void*>(src), n);
     } catch (const sycl::exception& ex) {
         std::fprintf(stderr, "sycl_compat cudaMemcpyAsync: %s\n", ex.what());
         return strata::sycl_compat::last_error() = cudaErrorUnknown;
@@ -276,7 +375,8 @@ inline cudaError_t cudaMemcpyAsync(void* dst, const void* src, size_t n, cudaMem
 
 inline cudaError_t cudaMemset(void* dst, int v, size_t n) {
     try {
-        strata::sycl_compat::default_queue().memset(dst, v, n).wait_and_throw();
+        const int od = strata::sycl_compat::owner_dev(dst);
+        strata::sycl_compat::default_queue_on(od >= 0 ? od : strata::sycl_compat::current_device_clamped()).memset(dst, v, n).wait_and_throw();
     } catch (const sycl::exception& ex) {
         std::fprintf(stderr, "sycl_compat cudaMemset: %s\n", ex.what());
         return strata::sycl_compat::last_error() = cudaErrorUnknown;
@@ -304,7 +404,7 @@ inline cudaError_t host_alloc_impl(void** p, size_t n) {
         // fault on it with EFAULT (measured: WeightTable::load short read).
         *p = sycl::malloc_host(n, default_queue());
         if (!*p) return last_error() = cudaErrorMemoryAllocation;
-        remember_alloc(*p, n);
+        remember_host(*p, n);
     } catch (const sycl::exception& ex) {
         std::fprintf(stderr, "sycl_compat cudaHostAlloc: %s\n", ex.what());
         return last_error() = cudaErrorMemoryAllocation;
@@ -393,6 +493,7 @@ inline cudaError_t cudaEventRecord(cudaEvent_t e, cudaStream_t s) {
     // an event on an in-order queue: a marker task whose completion == all prior work
     e->e = strata::sycl_compat::q_for(s).submit(
         [&](sycl::handler& h) { h.single_task([]() {}); });
+    e->dev = strata::sycl_compat::dev_of_stream(s);
     return cudaSuccess;
 }
 
@@ -419,6 +520,13 @@ inline cudaError_t cudaStreamQuery(cudaStream_t s) {
 inline cudaError_t cudaStreamWaitEvent(cudaStream_t s, cudaEvent_t e, unsigned = 0) {
     if (!e) return strata::sycl_compat::last_error() = cudaErrorInvalidValue;
     try {
+        const int sd = strata::sycl_compat::dev_of_stream(s);
+        if (e->dev >= 0 && e->dev != sd) {
+            // cross-device: no shared context to depend_on - block the host
+            // (the split only crosses cards once per window)
+            e->e.wait_and_throw();
+            return cudaSuccess;
+        }
         // in-order queues serialize anyway; make the dependency explicit
         strata::sycl_compat::q_for(s).submit(
             [&](sycl::handler& h) { h.depends_on(e->e); h.single_task([]() {}); });
@@ -492,14 +600,17 @@ inline cudaError_t cudaEventElapsedTime(float* ms, cudaEvent_t a, cudaEvent_t b)
 }
 
 inline cudaError_t cudaGetDevice(int* dev) {
-    // single-device backend for now; multi-device placement lands with the
-    // 1+N milestone (streams will carry their device).
     if (!dev) return strata::sycl_compat::last_error() = cudaErrorInvalidValue;
-    *dev = 0;
+    *dev = strata::sycl_compat::current_device_ref();
     return cudaSuccess;
 }
 
-inline cudaError_t cudaSetDevice(int) { return cudaSuccess; }
+inline cudaError_t cudaSetDevice(int d) {
+    if (d < 0 || d >= (int) strata::sycl_compat::device_list().size())
+        return strata::sycl_compat::last_error() = cudaErrorInvalidValue;
+    strata::sycl_compat::current_device_ref() = d;
+    return cudaSuccess;
+}
 
 static constexpr unsigned cudaDeviceScheduleSpin = 1;
 static constexpr unsigned cudaDeviceMapHost = 8;
@@ -555,7 +666,9 @@ inline cudaError_t cudaMemGetInfo(size_t* free_b, size_t* total_b) {
     try {
         const sycl::device d = strata::sycl_compat::default_queue().get_device();
         const size_t total = d.get_info<sycl::info::device::global_mem_size>();
-        const size_t used = strata::sycl_compat::allocated_bytes();
+        const size_t used = strata::sycl_compat::allocated_on(
+                                strata::sycl_compat::current_device_clamped())
+                                .load();
         if (total_b) *total_b = total;
         if (free_b) *free_b = total > used ? total - used : 0;
     } catch (const sycl::exception& exn) {
