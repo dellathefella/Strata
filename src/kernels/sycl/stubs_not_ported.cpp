@@ -35,12 +35,6 @@ void coupled_draft_sample(float*, int, const int32_t*, const int32_t*, int, cons
 }
 
 // ---- shared expert / moe combine / hit path ----
-void shared_expert(const uint8_t*, const uint8_t*, const uint16_t*, const SForm&, const uint8_t*, const float*,
-                   const float*, const SForm&, const uint8_t*, const float*, const float*, const SForm&,
-                   const uint8_t*, const float*, const float*, const uint16_t*, float*, float*, int64_t, int64_t, int,
-                   void*, const float*, const NativeSharedWeights*) {
-    unported("shared_expert");
-}
 void moe_combine(const float*, const float*, const float*, float*, int64_t, int64_t, void*) {
     unported("moe_combine");
 }

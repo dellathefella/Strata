@@ -101,4 +101,33 @@ void shared_expert_multi(int n_tok, const float* x, const uint16_t* x_bf16, cons
     check_throw(stream, "shared_expert_multi");
 }
 
+// The single-token entry point.  The MTP draft layer calls it with the NATIVE
+// weights only (x_f32 + NativeSharedWeights, every legacy form null), which is
+// bitwise shared_expert_multi on one token; the legacy S2/Q8_K gemv forms are
+// not ported and refuse loudly if ever asked.
+void shared_expert(const uint8_t*, const uint8_t*, const uint16_t* x_bf16, const SForm&, const uint8_t*,
+                   const float*, const float*, const SForm&, const uint8_t*, const float*, const float*,
+                   const SForm&, const uint8_t*, const float*, const float*, const uint16_t* gate_inp_bf16,
+                   float* scratch, float* out, int64_t n_embd, int64_t n_ff, int, void* stream, const float* x_f32,
+                   const NativeSharedWeights* native) {
+    if (n_embd <= 0 || n_ff <= 0) return;
+    const bool native_all = native && native->gate_data && native->up_data && native->down_data && native->q8_1;
+    if (!native_all || x_f32 == nullptr)
+        throw std::runtime_error("SYCL backend: shared_expert supports only the native projections (MTP path)");
+    if (scratch == nullptr) {
+        std::fprintf(stderr, "shared_expert: scratch is null; the caller owns it "
+                             "(see shared_expert_scratch_bytes)\n");
+        std::exit(1);
+    }
+    // the CUDA scratch carve: gate | up | h_q8_0 | h_q8k | g
+    uint8_t* p = (uint8_t*) scratch;
+    const uint64_t a = ((uint64_t) n_ff * 4 + 15) & ~15ull;
+    const uint64_t q0 = ((uint64_t) (n_ff / 32) * 34 + 15) & ~15ull;
+    const uint64_t qk = ((uint64_t) (n_ff / 256) * 292 + 15) & ~15ull;
+    float* gate = (float*) p;
+    float* up = (float*) (p + a);
+    float* g = (float*) (p + a * 2 + q0 + qk);
+    shared_expert_multi(1, x_f32, x_bf16, *native, gate_inp_bf16, gate, up, g, out, n_embd, n_ff, stream);
+}
+
 }  // namespace strata::kernels
