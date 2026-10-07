@@ -106,6 +106,10 @@ private:
     bool capture_prefill_dev(int T, std::string& err);   ///< E-4: without the mapped staging (inputs copied on device)
     bool capture_round(int T, bool coupled, std::string& err);
     bool capture_step(int j, bool coupled, std::string& err);
+    bool record_round(int T, bool coupled, std::string& err);   ///< the round's kernels, eager (SYCL) or inside a capture
+    bool record_step(int j, bool coupled, std::string& err);
+    cudaError_t launch_prefill(int T, std::string& err);        ///< graph replay, or the eager record under SYCL
+    cudaError_t launch_prefill_dev(int T, std::string& err);
     cudaGraphExec_t step_exec_[9] = {};
     // coupled draft sampling: its own round/step graphs (the argmax ones stay as they were), the request's
     // parameters and the penalty ring (mapped staging + device copies), the split scratch, token id -> subset index

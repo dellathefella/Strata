@@ -641,6 +641,10 @@ bool finish_capture(cudaStream_t cs, bool ok, cudaGraphExec_t& exec, const char*
 }  // namespace
 
 bool MtpDrafter::capture_prefill(int T, std::string& err) {
+#if defined(STRATA_USE_SYCL)
+    (void) T; (void) err;
+    return true;   // eager: launch_prefill records directly
+#else
     if (prefill_exec_[T]) return true;
     using namespace strata::kernels;
     if (cudaStreamBeginCapture(cs_, cudaStreamCaptureModeThreadLocal) != cudaSuccess) { err = "mtp: begin capture"; return false; }
@@ -649,21 +653,46 @@ bool MtpDrafter::capture_prefill(int T, std::string& err) {
     copy_i32_from_mapped(pos_, m_pos_, (int64_t) T * g_->n_head, cs_);
     const bool ok = record_forward(T, -1, cs_, err);   // K/V only, rows [0, T)
     return finish_capture(cs_, ok, prefill_exec_[T], "prefill", err);
+#endif
+}
+
+cudaError_t MtpDrafter::launch_prefill(int T, std::string& err) {
+#if defined(STRATA_USE_SYCL)
+    using namespace strata::kernels;
+    copy_i32_from_mapped(tok_, m_tok_, T, cs_);
+    copy_i32_from_mapped(step_, m_step_, (int64_t) T * 4, cs_);
+    copy_i32_from_mapped(pos_, m_pos_, (int64_t) T * g_->n_head, cs_);
+    return record_forward(T, -1, cs_, err) ? cudaSuccess : cudaErrorUnknown;
+#else
+    (void) err;
+    return cudaGraphLaunch(prefill_exec_[T], cs_);
+#endif
+}
+
+cudaError_t MtpDrafter::launch_prefill_dev(int T, std::string& err) {
+#if defined(STRATA_USE_SYCL)
+    return record_forward(T, -1, cs_, err) ? cudaSuccess : cudaErrorUnknown;
+#else
+    (void) err;
+    return cudaGraphLaunch(prefill_dev_exec_[T], cs_);
+#endif
 }
 
 bool MtpDrafter::capture_prefill_dev(int T, std::string& err) {
+#if defined(STRATA_USE_SYCL)
+    (void) T; (void) err;
+    return true;   // eager: launch_prefill_dev records directly
+#else
     if (prefill_dev_exec_[T]) return true;
     if (cudaStreamBeginCapture(cs_, cudaStreamCaptureModeThreadLocal) != cudaSuccess) { err = "mtp: begin capture"; return false; }
     const bool ok = record_forward(T, -1, cs_, err);   // K/V only, rows [0, T); tok_/step_/pos_ filled before launch
     return finish_capture(cs_, ok, prefill_dev_exec_[T], "prefill (device inputs)", err);
+#endif
 }
 
-bool MtpDrafter::capture_round(int T, bool coupled, std::string& err) {
-    cudaGraphExec_t& exec = coupled ? round_exec_c_[T] : round_exec_[T];
-    if (exec) return true;
+bool MtpDrafter::record_round(int T, bool coupled, std::string& err) {
     using namespace strata::kernels;
     const int64_t HCN = g_->hc * g_->n_embd;
-    if (cudaStreamBeginCapture(cs_, cudaStreamCaptureModeThreadLocal) != cudaSuccess) { err = "mtp: begin capture"; return false; }
     bool ok = true;
     // coupled: the request's chain and the penalty history's base, for this round's drafts
     if (coupled) coupled_draft_stage(m_cparams_, m_chist_, cparams_, cring_, kCoupledHistCap, cs_);
@@ -687,18 +716,30 @@ bool MtpDrafter::capture_round(int T, bool coupled, std::string& err) {
         coupled_rec_ = false;
     }
     if (ok) mtp_select(R_, HCN, out_ids_, row_ + 1, Rin_, tok_, m_out_, 0, cs_, probs_, m_prob_);
+    return ok;
+}
+
+bool MtpDrafter::capture_round(int T, bool coupled, std::string& err) {
+#if defined(STRATA_USE_SYCL)
+    // eager: the round is recorded directly at launch (the shim's graph
+    // replay costs ~800 ms per launch on Level Zero)
+    (void) T; (void) coupled; (void) err;
+    return true;
+#else
+    cudaGraphExec_t& exec = coupled ? round_exec_c_[T] : round_exec_[T];
+    if (exec) return true;
+    if (cudaStreamBeginCapture(cs_, cudaStreamCaptureModeThreadLocal) != cudaSuccess) { err = "mtp: begin capture"; return false; }
+    const bool ok = record_round(T, coupled, err);
     return finish_capture(cs_, ok, exec, coupled ? "round (coupled)" : "round", err);
+#endif
 }
 
 // Chain step j (1..max_t-2): one row at the cell staged in step row `max_t + j - 1`, from the previous step's
 // residual and token (left in Rin_[0] / tok_[0] by mtp_select); draft j and its probability to the mapped outputs.
-bool MtpDrafter::capture_step(int j, bool coupled, std::string& err) {
-    cudaGraphExec_t& exec = coupled ? step_exec_c_[j] : step_exec_[j];
-    if (exec) return true;
+bool MtpDrafter::record_step(int j, bool coupled, std::string& err) {
     using namespace strata::kernels;
     const int64_t HCN = g_->hc * g_->n_embd;
     const int row = max_t_ + j - 1;
-    if (cudaStreamBeginCapture(cs_, cudaStreamCaptureModeThreadLocal) != cudaSuccess) { err = "mtp: begin capture"; return false; }
     copy_i32_from_mapped(step_ + row * 4, m_step_ + row * 4, 4, cs_);
     copy_i32_from_mapped(pos_ + row * g_->n_head, m_pos_ + row * g_->n_head, g_->n_head, cs_);
     coupled_rec_ = coupled;
@@ -706,7 +747,20 @@ bool MtpDrafter::capture_step(int j, bool coupled, std::string& err) {
     bool ok = record_forward(1, row, cs_, err);
     coupled_rec_ = false;
     if (ok) mtp_select(R_, HCN, out_ids_, row_ + 1, Rin_, tok_, m_out_, j, cs_, probs_, m_prob_);
+    return ok;
+}
+
+bool MtpDrafter::capture_step(int j, bool coupled, std::string& err) {
+#if defined(STRATA_USE_SYCL)
+    (void) j; (void) coupled; (void) err;
+    return true;   // eager: recorded at launch
+#else
+    cudaGraphExec_t& exec = coupled ? step_exec_c_[j] : step_exec_[j];
+    if (exec) return true;
+    if (cudaStreamBeginCapture(cs_, cudaStreamCaptureModeThreadLocal) != cudaSuccess) { err = "mtp: begin capture"; return false; }
+    const bool ok = record_step(j, coupled, err);
     return finish_capture(cs_, ok, exec, coupled ? "step (coupled)" : "step", err);
+#endif
 }
 
 void MtpDrafter::kv_restore(int64_t upto) {
@@ -771,7 +825,7 @@ bool MtpDrafter::prefill(const float* R_rows, const int32_t* next_tokens, int64_
                 cudaMemcpyAsync(pos_, d_ps + c * NHp, (size_t) (T * NHp) * 4, cudaMemcpyDeviceToDevice, cs_) != cudaSuccess ||
                 cudaMemcpyAsync(Rin_, R_rows + (size_t) c * HCN, (size_t) T * HCN * sizeof(float), cudaMemcpyDeviceToDevice,
                                 cs_) != cudaSuccess ||
-                cudaGraphLaunch(prefill_dev_exec_[T], cs_) != cudaSuccess) {
+                launch_prefill_dev((int) T, err) != cudaSuccess) {
                 err = std::string("mtp prefill: ") + cudaGetErrorString(cudaGetLastError());
                 return false;
             }
@@ -798,7 +852,7 @@ bool MtpDrafter::prefill(const float* R_rows, const int32_t* next_tokens, int64_
         }
         if (cudaMemcpyAsync(Rin_, R_rows + (size_t) c * HCN, (size_t) T * HCN * sizeof(float), cudaMemcpyDeviceToDevice,
                             cs_) != cudaSuccess ||
-            cudaGraphLaunch(prefill_exec_[T], cs_) != cudaSuccess ||
+            launch_prefill((int) T, err) != cudaSuccess ||
             cudaStreamSynchronize(cs_) != cudaSuccess) {
             err = std::string("mtp prefill: ") + cudaGetErrorString(cudaGetLastError());
             return false;
@@ -831,8 +885,12 @@ bool MtpDrafter::draft(int T, const int32_t* tokens, int64_t p, int a, int32_t* 
     h_row_[0] = a;
     h_row_[1] = 0;
     std::atomic_thread_fence(std::memory_order_seq_cst);
+#if defined(STRATA_USE_SYCL)
+    if (!record_round(T, cp, err) || cudaStreamSynchronize(cs_) != cudaSuccess) {
+#else
     if (cudaGraphLaunch(cp ? round_exec_c_[T] : round_exec_[T], cs_) != cudaSuccess ||
         cudaStreamSynchronize(cs_) != cudaSuccess) {
+#endif
         err = std::string("mtp draft: ") + cudaGetErrorString(cudaGetLastError());
         return false;
     }
@@ -845,8 +903,12 @@ bool MtpDrafter::draft(int T, const int32_t* tokens, int64_t p, int a, int32_t* 
         if (!capture_step(j, cp, err)) return false;
         put(max_t_ + j - 1, coupled_draft_cell(p, a, j));   // p + a + j; coupled: drawn at counter cell + 1
         std::atomic_thread_fence(std::memory_order_seq_cst);
+#if defined(STRATA_USE_SYCL)
+        if (!record_step(j, cp, err) || cudaStreamSynchronize(cs_) != cudaSuccess) {
+#else
         if (cudaGraphLaunch(cp ? step_exec_c_[j] : step_exec_[j], cs_) != cudaSuccess ||
             cudaStreamSynchronize(cs_) != cudaSuccess) {
+#endif
             err = std::string("mtp draft step: ") + cudaGetErrorString(cudaGetLastError());
             return false;
         }
