@@ -108,8 +108,11 @@ bool cvec_upload(const std::vector<float>&, const std::vector<float>&, int, int,
     return false;
 }
 bool cvec_replicate(std::string& err) {
-    err = "SYCL backend: control vectors are not ported yet";
-    return false;
+    // CUDA: !loaded() || upload_here() - nothing can be loaded on this
+    // backend (cvec_upload refuses), so the replicate is a no-op success;
+    // a stage init calls it unconditionally
+    (void) err;
+    return true;
 }
 
 
